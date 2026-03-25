@@ -43,6 +43,12 @@ app.use('/api/products', productsRoutes);
 const productsByStoreRoutes = require('./src/routes/productsByStore');
 app.use('/api/products-by-store', productsByStoreRoutes);
 
+const ordersRoutes = require('./src/routes/orders');
+app.use('/api/orders', ordersRoutes);
+
+const physicalInventoryRoutes = require('./src/routes/physicalinventory');
+app.use('/api/physical-inventories', physicalInventoryRoutes);
+
 // Rutas de autenticación y usuarios
 const authRoutes = require('./src/routes/auth');
 app.use('/api/auth', authRoutes);

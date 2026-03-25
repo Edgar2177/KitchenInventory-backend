@@ -577,9 +577,7 @@ const exportProductsToCSV = async (req, res) => {
         p.empty_weight as 'Empty Weight',
         p.empty_weight_unit as 'Empty Weight Unit',
         p.case_size as 'Case Size',
-        v.vendor_name as 'Vendor',
-        p.created_at as 'Created At',
-        p.updated_at as 'Updated At'
+        v.vendor_name as 'Vendor'
       FROM products p
       INNER JOIN product_types pt ON p.id_product_type = pt.id_product_types
       INNER JOIN categories c ON p.id_category = c.id_categories
