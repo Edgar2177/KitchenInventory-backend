@@ -1,4 +1,5 @@
 const pool = require('../config/database');
+const XLSX = require('xlsx');
 
 // ========================================
 // FUNCIONES AUXILIARES
@@ -35,7 +36,7 @@ const getLastInventoryOrder = async (locationId) => {
 };
 
 const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmptyWeight) => {
-  let fullWeight = itemFullWeight ? parseFloat(itemFullWeight) : null;
+  let fullWeight  = itemFullWeight  ? parseFloat(itemFullWeight)  : null;
   let emptyWeight = itemEmptyWeight ? parseFloat(itemEmptyWeight) : null;
 
   if (!fullWeight || !emptyWeight) {
@@ -44,7 +45,7 @@ const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmp
       [productId]
     );
     if (product.length > 0) {
-      fullWeight = fullWeight || parseFloat(product[0].full_weight) || null;
+      fullWeight  = fullWeight  || parseFloat(product[0].full_weight)  || null;
       emptyWeight = emptyWeight || parseFloat(product[0].empty_weight) || null;
     }
   }
@@ -56,7 +57,6 @@ const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmp
   return { fullWeight: fullWeight || null, emptyWeight: emptyWeight || null, netWeight: null };
 };
 
-// Validar items — solo cantidad obligatoria, wholesale se calcula en el frontend
 const validateInventoryItems = (items) => {
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -68,6 +68,26 @@ const validateInventoryItems = (items) => {
     }
   }
   return { valid: true };
+};
+
+// ========================================
+// AUTO-CREAR LOCATION "From Excel" POR STORE
+// ========================================
+const getOrCreateFromExcelLocation = async (storeId) => {
+  const [existing] = await pool.execute(
+    `SELECT id_locations FROM locations 
+     WHERE LOWER(TRIM(location_name)) = 'from excel' AND id_store = ?`,
+    [storeId]
+  );
+
+  if (existing.length > 0) return existing[0].id_locations;
+
+  const [result] = await pool.execute(
+    `INSERT INTO locations (location_name, id_store) VALUES ('From Excel', ?)`,
+    [storeId]
+  );
+
+  return result.insertId;
 };
 
 // ========================================
@@ -87,7 +107,6 @@ const getAllInventories = async (req, res) => {
         i.id_location,
         l.location_name,
         i.total_ws_value,
-        
         i.total_losses_value,
         i.created_at,
         s.store_name,
@@ -212,22 +231,12 @@ const createInventory = async (req, res) => {
     await connection.beginTransaction();
 
     const { storeId, locationId, inventoryDate, items, waste = [] } = req.body;
-    console.log('DEBUG createInventory - Received:', { 
-      storeId, 
-      locationId, 
-      inventoryDate, 
-      itemsCount: items?.length || 0,
-      wasteCount: waste?.length || 0,
-      status: req.body.status 
-    });
 
-    // Validación básica
     if (!storeId || !inventoryDate) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'La tienda y fecha son requeridos' });
     }
 
-    // Si status es 'Locked', validar que haya productos
     const status = req.body.status || 'Open';
     if (status === 'Locked' && (!items || items.length === 0)) {
       await connection.rollback();
@@ -239,7 +248,6 @@ const createInventory = async (req, res) => {
       return res.status(400).json({ success: false, message: 'La ubicación es requerida' });
     }
 
-    // Solo validar inventario activo si intentamos crear uno Locked (cerrado)
     if (status === 'Locked') {
       const activeInventoryId = await checkActiveInventory(locationId);
       if (activeInventoryId) {
@@ -248,10 +256,8 @@ const createInventory = async (req, res) => {
       }
     }
 
-    // Procesar items solo si hay productos
     let finalItems = [];
     if (items && items.length > 0) {
-      // Validar solo si es status Locked (cerrado)
       if (status === 'Locked') {
         const validation = validateInventoryItems(items);
         if (!validation.valid) {
@@ -260,13 +266,12 @@ const createInventory = async (req, res) => {
         }
       }
 
-      // Orden basado en el último inventario
       const lastOrder = await getLastInventoryOrder(locationId);
-      const orderMap = new Map();
+      const orderMap  = new Map();
       lastOrder.forEach(item => orderMap.set(item.id_product, item.display_order));
 
       const orderedItems = [];
-      const newProducts = [];
+      const newProducts  = [];
       items.forEach(item => {
         if (orderMap.has(item.productId)) {
           orderedItems.push({ ...item, order: orderMap.get(item.productId) });
@@ -278,12 +283,11 @@ const createInventory = async (req, res) => {
 
       let currentOrder = 1;
       finalItems = [
-        ...newProducts.map(item => ({ ...item, order: currentOrder++ })),
-        ...orderedItems.map(item => ({ ...item, order: currentOrder++ }))
+        ...newProducts.map(item  => ({ ...item,  order: currentOrder++ })),
+        ...orderedItems.map(item => ({ ...item,  order: currentOrder++ }))
       ];
     }
 
-    // Crear inventario (status puede ser 'Unlocked' o 'Locked')
     const [result] = await connection.execute(
       `INSERT INTO inventories (id_store, id_location, inventory_type, inventory_date, status, total_ws_value, total_losses_value)
        VALUES (?, ?, 'Standard', ?, ?, 0, 0)`,
@@ -291,19 +295,12 @@ const createInventory = async (req, res) => {
     );
     const inventoryId = result.insertId;
 
-    // Insertar items (puede estar vacío si status = Unlocked)
     let totalWsValue = 0;
-    console.log('DEBUG - Inserting items:', finalItems.length, 'items, status:', status);
     for (const item of finalItems) {
-      // Validar que quantity sea un número válido
       const quantity = parseFloat(item.quantity);
       if (isNaN(quantity)) {
-        console.error('ERROR - Invalid quantity for product:', item.productName, 'quantity:', item.quantity);
         await connection.rollback();
-        return res.status(400).json({ 
-          success: false, 
-          message: `Invalid quantity for product: ${item.productName}` 
-        });
+        return res.status(400).json({ success: false, message: `Invalid quantity for product: ${item.productName}` });
       }
       const wsValue = parseFloat(item.wholesaleValue) || 0;
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
@@ -319,7 +316,6 @@ const createInventory = async (req, res) => {
       totalWsValue += wsValue;
     }
 
-    // Insertar waste
     let totalWasteValue = 0;
     for (const w of waste) {
       const wsValue = parseFloat(w.wholesaleValue) || 0;
@@ -333,7 +329,6 @@ const createInventory = async (req, res) => {
       totalWasteValue += wsValue;
     }
 
-    // Actualizar totales
     await connection.execute(
       `UPDATE inventories SET total_ws_value = ?, total_losses_value = ? WHERE id_inventories = ?`,
       [totalWsValue, totalWasteValue, inventoryId]
@@ -343,8 +338,6 @@ const createInventory = async (req, res) => {
     res.status(201).json({ success: true, message: 'Inventario creado exitosamente', data: { id: inventoryId, totalWsValue, totalWasteValue } });
   } catch (error) {
     await connection.rollback();
-    console.error('❌ ERROR in createInventory:', error.message);
-    console.error('Stack:', error.stack);
     res.status(500).json({ success: false, message: 'Error al crear el inventario', error: error.message });
   } finally {
     connection.release();
@@ -382,7 +375,6 @@ const updateInventory = async (req, res) => {
       }
     }
 
-    // Validar items solo si el status que se está guardando es Locked
     if (items && items.length > 0 && status === 'Locked') {
       const validation = validateInventoryItems(items);
       if (!validation.valid) {
@@ -391,10 +383,9 @@ const updateInventory = async (req, res) => {
       }
     }
 
-    // Actualizar fecha, ubicación y/o status si vienen en el body
     if (inventoryDate || locationId || status) {
       const updates = [];
-      const params = [];
+      const params  = [];
       if (inventoryDate) { updates.push('inventory_date = ?'); params.push(inventoryDate); }
       if (locationId)    { updates.push('id_location = ?');    params.push(locationId); }
       if (status)        { updates.push('status = ?');         params.push(status); }
@@ -421,12 +412,10 @@ const updateInventory = async (req, res) => {
         totalWsValue += wsValue;
       }
 
-      // Actualizar waste
       await connection.execute('DELETE FROM inventory_losses WHERE id_inventory = ?', [id]);
       let totalWasteValue = 0;
       for (const w of waste) {
         const wsValue = parseFloat(w.wholesaleValue) || 0;
-
         await connection.execute(
           `INSERT INTO inventory_losses (id_inventory, id_product, quantity, unit, reason, loss_value)
            VALUES (?, ?, ?, ?, ?, ?)`,
@@ -456,12 +445,8 @@ const deleteInventory = async (req, res) => {
     const { id } = req.params;
     const [inventory] = await pool.execute('SELECT status FROM inventories WHERE id_inventories = ?', [id]);
 
-    if (inventory.length === 0) {
-      return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
-    }
-    if (inventory[0].status === 'Locked') {
-      return res.status(400).json({ success: false, message: 'No se puede eliminar un inventario bloqueado' });
-    }
+    if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
+    if (inventory[0].status === 'Locked') return res.status(400).json({ success: false, message: 'No se puede eliminar un inventario bloqueado' });
 
     await pool.execute('DELETE FROM inventories WHERE id_inventories = ?', [id]);
     res.json({ success: true, message: 'Inventario eliminado exitosamente' });
@@ -475,9 +460,7 @@ const toggleLockInventory = async (req, res) => {
     const { id } = req.params;
     const [inventory] = await pool.execute('SELECT status FROM inventories WHERE id_inventories = ?', [id]);
 
-    if (inventory.length === 0) {
-      return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
-    }
+    if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
 
     const newStatus = inventory[0].status === 'Locked' ? 'Unlocked' : 'Locked';
     await pool.execute('UPDATE inventories SET status = ? WHERE id_inventories = ?', [newStatus, id]);
@@ -496,7 +479,6 @@ const reorderInventoryItems = async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-
     const { id } = req.params;
     const { itemOrders } = req.body;
 
@@ -523,26 +505,13 @@ const reorderInventoryItems = async (req, res) => {
   }
 };
 
-
-/**
- * Obtener productos del último inventario de una ubicación
- * Para precargar en un nuevo inventario (sin pesos)
- */
 const getLastInventoryProducts = async (req, res) => {
   try {
     const { locationId } = req.params;
+    if (!locationId) return res.status(400).json({ success: false, message: 'locationId es requerido' });
 
-    if (!locationId) {
-      return res.status(400).json({ success: false, message: 'locationId es requerido' });
-    }
-
-    // Buscar el último inventario de esta ubicación
     const [lastInventory] = await pool.execute(
-      `SELECT id_inventories 
-       FROM inventories 
-       WHERE id_location = ? 
-       ORDER BY id_inventories DESC 
-       LIMIT 1`,
+      `SELECT id_inventories FROM inventories WHERE id_location = ? ORDER BY id_inventories DESC LIMIT 1`,
       [locationId]
     );
 
@@ -552,14 +521,6 @@ const getLastInventoryProducts = async (req, res) => {
 
     const lastInventoryId = lastInventory[0].id_inventories;
 
-    // Obtener el id_store del inventario para filtrar products_by_store
-    const [invData] = await pool.execute(
-      'SELECT id_store FROM inventories WHERE id_inventories = ?',
-      [lastInventoryId]
-    );
-    const storeId = invData[0]?.id_store;
-
-    // Obtener los productos del último inventario con todos sus datos
     const [items] = await pool.execute(
       `SELECT 
         ii.display_order,
@@ -590,6 +551,218 @@ const getLastInventoryProducts = async (req, res) => {
   }
 };
 
+// ========================================
+// IMPORTAR INVENTARIO DESDE EXCEL
+//
+// Formato esperado (igual al reporte PDF):
+//   Category | Product ID | Product | Last Inv | Purchase | INV - 1 | INV - 2 | INV - 3
+//
+// Lógica:
+//   - Busca el producto por Product ID (product_code) primero, luego por Product (product_name)
+//   - Solo acepta productos que estén asignados a la tienda (products_by_store)
+//   - Trae todos los datos del producto desde la DB (container_type, weights, price, etc.)
+//   - Current Weight = INV - 1 + INV - 2 + INV - 3
+//   - Filas donde la suma total sea 0 se omiten (producto sin inventario)
+//   - Location se auto-crea como "From Excel" por tienda
+// ========================================
+const importInventoryFromExcel = async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+
+    const { storeId, inventoryDate } = req.body;
+    if (!storeId) {
+      return res.status(400).json({ success: false, message: 'storeId is required' });
+    }
+
+    // Auto-crear o recuperar la location "From Excel"
+    const locationId = await getOrCreateFromExcelLocation(storeId);
+
+    // Leer Excel
+    const workbook  = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+    const data      = XLSX.utils.sheet_to_json(worksheet, { defval: null });
+
+    const date = inventoryDate || new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+    let imported = 0;
+    let skipped  = 0;
+    const errors = [];
+    const items  = [];
+
+    for (let i = 0; i < data.length; i++) {
+      const row    = data[i];
+      const rowNum = i + 2;
+
+      // Leer identificadores del producto
+      const productCode = row['Product ID'] ? String(row['Product ID']).trim() : null;
+      const productName = row['Product']    ? String(row['Product']).trim()    : null;
+
+      // Saltar filas vacías
+      if (!productCode && !productName) { skipped++; continue; }
+
+      // Sumar INV - 1 + INV - 2 + INV - 3
+      const inv1 = parseFloat(row['INV - 1']) || 0;
+      const inv2 = parseFloat(row['INV - 2']) || 0;
+      const inv3 = parseFloat(row['INV - 3']) || 0;
+      const quantity = inv1 + inv2 + inv3;
+
+      // Omitir productos sin cantidad
+      if (quantity <= 0) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        // Buscar producto en la DB — solo si está asignado a esta tienda
+        let productRow = null;
+
+        if (productCode) {
+          const [byCode] = await connection.execute(
+            `SELECT 
+               p.id_products, p.product_name, p.product_code, p.container_type,
+               p.full_weight_base_unit as full_weight,
+               p.empty_weight_base_unit as empty_weight,
+               p.wholesale_price, p.case_size,
+               p.container_size, p.container_unit
+             FROM products p
+             INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+             WHERE LOWER(TRIM(p.product_code)) = LOWER(TRIM(?)) AND pbs.id_store = ?`,
+            [productCode, storeId]
+          );
+          if (byCode.length > 0) productRow = byCode[0];
+        }
+
+        if (!productRow && productName) {
+          const [byName] = await connection.execute(
+            `SELECT 
+               p.id_products, p.product_name, p.product_code, p.container_type,
+               p.full_weight_base_unit as full_weight,
+               p.empty_weight_base_unit as empty_weight,
+               p.wholesale_price, p.case_size,
+               p.container_size, p.container_unit
+             FROM products p
+             INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+             WHERE LOWER(TRIM(p.product_name)) = LOWER(TRIM(?)) AND pbs.id_store = ?`,
+            [productName, storeId]
+          );
+          if (byName.length > 0) productRow = byName[0];
+        }
+
+        // Si no se encontró en la tienda, reportar error
+        if (!productRow) {
+          errors.push(`Row ${rowNum}: Product "${productName || productCode}" not found in this store`);
+          skipped++;
+          continue;
+        }
+
+        // Usar container_type del producto como weight type
+        const weightType = productRow.container_type || 'g';
+
+        // Calcular wholesale value con los datos del producto
+        const containerTypes = ['Bottle', 'Keg', 'Can', 'Each'];
+        let wholesaleValue = 0;
+        if (productRow.wholesale_price) {
+          const price = parseFloat(productRow.wholesale_price);
+          if (containerTypes.includes(weightType)) {
+            // Para contenedores: cantidad * precio
+            wholesaleValue = quantity * price;
+          } else if (productRow.full_weight && productRow.empty_weight) {
+            // Para peso: calcular porcentaje
+            const full  = parseFloat(productRow.full_weight);
+            const empty = parseFloat(productRow.empty_weight);
+            if (full > empty) {
+              const pct = Math.min(Math.max((quantity - empty) / (full - empty), 0), 1);
+              wholesaleValue = pct * price;
+            }
+          }
+        }
+
+        items.push({
+          productId:      productRow.id_products,
+          productName:    productRow.product_name,
+          quantityType:   weightType,
+          quantity,
+          wholesaleValue,
+          fullWeight:     productRow.full_weight  || null,
+          emptyWeight:    productRow.empty_weight || null,
+          caseSize:       productRow.case_size    || null,
+          displayOrder:   imported + 1
+        });
+
+        imported++;
+      } catch (rowError) {
+        console.error(`Error processing row ${rowNum}:`, rowError);
+        errors.push(`Row ${rowNum}: ${rowError.message}`);
+        skipped++;
+      }
+    }
+
+    if (items.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        message: 'No valid products found in the file',
+        stats: { total: data.length, imported: 0, skipped, errors }
+      });
+    }
+
+    // Crear el inventario con location "From Excel"
+    const [invResult] = await connection.execute(
+      `INSERT INTO inventories (id_store, id_location, inventory_type, inventory_date, status, total_ws_value, total_losses_value)
+       VALUES (?, ?, 'Standard', ?, 'Unlocked', 0, 0)`,
+      [storeId, locationId, date]
+    );
+    const inventoryId = invResult.insertId;
+
+    let totalWsValue = 0;
+    for (const item of items) {
+      const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
+      await connection.execute(
+        `INSERT INTO inventory_items (id_inventory, id_product, id_location, display_order, quantity_type, quantity, case_size, weight_oz, full_weight, empty_weight, net_weight, wholesale_value)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [inventoryId, item.productId, locationId, item.displayOrder,
+         item.quantityType, item.quantity,
+         item.caseSize ? parseInt(item.caseSize) : null,
+         null,
+         weights.fullWeight, weights.emptyWeight, weights.netWeight,
+         item.wholesaleValue]
+      );
+      totalWsValue += item.wholesaleValue;
+    }
+
+    await connection.execute(
+      `UPDATE inventories SET total_ws_value = ? WHERE id_inventories = ?`,
+      [totalWsValue, inventoryId]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      success: true,
+      message: 'Import completed',
+      data: { inventoryId, locationId, locationName: 'From Excel' },
+      stats: {
+        total:    data.length,
+        imported,
+        skipped,
+        errors:   errors.length > 0 ? errors : undefined
+      }
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('Import inventory error:', error);
+    res.status(500).json({ success: false, message: 'Error importing inventory', error: error.message });
+  } finally {
+    connection.release();
+  }
+};
+
 module.exports = {
   getAllInventories,
   getInventoryById,
@@ -599,5 +772,6 @@ module.exports = {
   toggleLockInventory,
   getAvailableProducts,
   reorderInventoryItems,
-  getLastInventoryProducts
+  getLastInventoryProducts,
+  importInventoryFromExcel
 };
