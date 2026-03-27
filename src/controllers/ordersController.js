@@ -54,6 +54,7 @@ const calculateOrderSuggestions = async (req, res) => {
         p.container_size,
         p.container_unit,
         p.wholesale_price,
+        p.case_size,
         pbs.par,
         pbs.reorder_point,
         pbs.order_by_the as order_by,
@@ -121,6 +122,11 @@ const calculateOrderSuggestions = async (req, res) => {
       const stockOnHand = stockMap[product.id_products] || 0;
       const reorderPoint = parseFloat(product.reorder_point) || 0;
       const par = parseFloat(product.par) || 0;
+      const caseSize = parseFloat(product.case_size) || 1;
+
+      const stockForCalc = product.order_by === 'Case'
+        ? stockOnHand / caseSize
+        : stockOnHand;
 
       let suggestedOrder = 0;
       if (stockOnHand <= reorderPoint) {
@@ -134,13 +140,17 @@ const calculateOrderSuggestions = async (req, res) => {
         product_code: product.product_code,
         container_size: product.container_size,
         container_unit: product.container_unit,
-        stock_on_hand: stockOnHand,
+        stock_on_hand: product.order_by === 'Case'
+          ? parseFloat((stockOnHand / caseSize).toFixed(2))
+          : stockOnHand,
         reorder_point: reorderPoint,
         par: par,
         order_by: product.order_by,
         suggested_order: suggestedOrder,
         actual_order: suggestedOrder,
-        unit_price: parseFloat(product.wholesale_price) || 0,
+        unit_price: product.case_size && parseFloat(product.case_size) > 0
+          ? parseFloat(product.wholesale_price) / parseFloat(product.case_size)
+          : parseFloat(product.wholesale_price) || 0,
         is_missing_from_inventory: stockOnHand === 0
       });
     });

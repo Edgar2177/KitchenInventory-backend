@@ -283,8 +283,8 @@ const createInventory = async (req, res) => {
 
       let currentOrder = 1;
       finalItems = [
-        ...newProducts.map(item  => ({ ...item,  order: currentOrder++ })),
-        ...orderedItems.map(item => ({ ...item,  order: currentOrder++ }))
+        ...newProducts.map(item  => ({ ...item, order: currentOrder++ })),
+        ...orderedItems.map(item => ({ ...item, order: currentOrder++ }))
       ];
     }
 
@@ -554,15 +554,16 @@ const getLastInventoryProducts = async (req, res) => {
 // ========================================
 // IMPORTAR INVENTARIO DESDE EXCEL
 //
-// Formato esperado (igual al reporte PDF):
-//   Category | Product ID | Product | Last Inv | Purchase | INV - 1 | INV - 2 | INV - 3
+// Formato esperado:
+//   Product Name | Product Code | Closing Inv | Container Type
 //
 // Lógica:
-//   - Busca el producto por Product ID (product_code) primero, luego por Product (product_name)
-//   - Solo acepta productos que estén asignados a la tienda (products_by_store)
-//   - Trae todos los datos del producto desde la DB (container_type, weights, price, etc.)
-//   - Current Weight = INV - 1 + INV - 2 + INV - 3
-//   - Filas donde la suma total sea 0 se omiten (producto sin inventario)
+//   - Busca el producto por Product Code primero, luego por Product Name
+//   - Solo acepta productos asignados a la tienda (products_by_store)
+//   - Trae datos del producto desde la DB (weights, price, case_size, etc.)
+//   - Current Weight = Closing Inv (ya viene sumado)
+//   - Container Type se toma del Excel, si no existe se usa el de la DB
+//   - Filas con cantidad 0 se omiten
 //   - Location se auto-crea como "From Excel" por tienda
 // ========================================
 const importInventoryFromExcel = async (req, res) => {
@@ -599,17 +600,15 @@ const importInventoryFromExcel = async (req, res) => {
       const rowNum = i + 2;
 
       // Leer identificadores del producto
-      const productCode = row['Product ID'] ? String(row['Product ID']).trim() : null;
-      const productName = row['Product']    ? String(row['Product']).trim()    : null;
+      const productCode         = row['Product Code'] ? String(row['Product Code']).trim() : null;
+      const productName         = row['Product Name'] ? String(row['Product Name']).trim() : null;
+      const containerTypeExcel  = row['Container Type'] ? String(row['Container Type']).trim() : null;
 
       // Saltar filas vacías
       if (!productCode && !productName) { skipped++; continue; }
 
-      // Sumar INV - 1 + INV - 2 + INV - 3
-      const inv1 = parseFloat(row['INV - 1']) || 0;
-      const inv2 = parseFloat(row['INV - 2']) || 0;
-      const inv3 = parseFloat(row['INV - 3']) || 0;
-      const quantity = inv1 + inv2 + inv3;
+      // Closing Inv = cantidad ya sumada
+      const quantity = parseFloat(row['Closing Inv']) || 0;
 
       // Omitir productos sin cantidad
       if (quantity <= 0) {
@@ -660,38 +659,39 @@ const importInventoryFromExcel = async (req, res) => {
           continue;
         }
 
-        // Usar container_type del producto como weight type
-        const weightType = productRow.container_type || 'g';
+        // Container Type: usar el del Excel primero, si no el de la DB
+        const weightType = containerTypeExcel || productRow.container_type || 'Bottle';
 
-        // Calcular wholesale value con los datos del producto
-        const containerTypes = ['Bottle', 'Keg', 'Can', 'Each'];
+        // Calcular wholesale value
+        const containerTypes = ['Bottle', 'Keg', 'Can', 'Each', 'Case', 'Bag', 'Carton'];
         let wholesaleValue = 0;
         if (productRow.wholesale_price) {
-          const price = parseFloat(productRow.wholesale_price);
+          const price    = parseFloat(productRow.wholesale_price);
+          const caseSize = parseFloat(productRow.case_size) || 1;
+          const unitPrice = caseSize > 0 ? price / caseSize : price;
+
           if (containerTypes.includes(weightType)) {
-            // Para contenedores: cantidad * precio
-            wholesaleValue = quantity * price;
+            wholesaleValue = quantity * unitPrice;
           } else if (productRow.full_weight && productRow.empty_weight) {
-            // Para peso: calcular porcentaje
             const full  = parseFloat(productRow.full_weight);
             const empty = parseFloat(productRow.empty_weight);
             if (full > empty) {
               const pct = Math.min(Math.max((quantity - empty) / (full - empty), 0), 1);
-              wholesaleValue = pct * price;
+              wholesaleValue = pct * unitPrice;
             }
           }
         }
 
         items.push({
-          productId:      productRow.id_products,
-          productName:    productRow.product_name,
-          quantityType:   weightType,
+          productId:    productRow.id_products,
+          productName:  productRow.product_name,
+          quantityType: weightType,
           quantity,
           wholesaleValue,
-          fullWeight:     productRow.full_weight  || null,
-          emptyWeight:    productRow.empty_weight || null,
-          caseSize:       productRow.case_size    || null,
-          displayOrder:   imported + 1
+          fullWeight:   productRow.full_weight  || null,
+          emptyWeight:  productRow.empty_weight || null,
+          caseSize:     productRow.case_size    || null,
+          displayOrder: imported + 1
         });
 
         imported++;
