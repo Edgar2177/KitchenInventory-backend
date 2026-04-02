@@ -128,13 +128,6 @@ const generateOrderEmailHTML = (orderData) => {
       </div>
       ` : ''}
 
-      <!-- Total Amount -->
-      <div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #e2e8f0; text-align: right;">
-        <p style="margin: 0; font-size: 18px; font-weight: 600; color: #0f172a;">
-          Total Amount: <span style="color: #0ea5e9;">$${parseFloat(total_amount || 0).toFixed(2)}</span>
-        </p>
-      </div>
-
       <!-- Footer Note -->
       <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; font-size: 13px; color: #475569;">
         <p style="margin: 0;"><strong>📋 Important:</strong> This is an automated purchase order from our Inventory Management System.</p>
