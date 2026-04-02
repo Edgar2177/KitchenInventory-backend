@@ -1,498 +1,186 @@
-const pool = require('../config/database');
-const { sendOrderEmail: sendEmail } = require('../services/emailService');
+const nodemailer = require('nodemailer');
 
-// ============================================
-// GET INVENTORIES FOR SELECTOR
-// ============================================
-const getInventoriesForOrdering = async (req, res) => {
-  try {
-    const { storeId } = req.query;
+// Configurar transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
+  secure: process.env.EMAIL_SECURE === 'true',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD,
+  },
+});
 
-    if (!storeId) {
-      return res.status(400).json({ message: 'Store ID is required' });
-    }
-
-    const [inventories] = await pool.execute(
-      `SELECT 
-        DATE(i.inventory_date) as inventory_date,
-        MAX(i.id_inventories) as id_inventories,
-        GROUP_CONCAT(DISTINCT l.location_name ORDER BY l.location_name SEPARATOR ', ') as location_name,
-        SUM(i.total_ws_value) as total_ws_value,
-        COUNT(DISTINCT ii.id_inventory_item) as product_count
-      FROM inventories i
-      LEFT JOIN locations l ON i.id_location = l.id_locations
-      LEFT JOIN inventory_items ii ON i.id_inventories = ii.id_inventory
-      WHERE i.id_store = ? AND i.status = 'Locked'
-      GROUP BY DATE(i.inventory_date)
-      ORDER BY DATE(i.inventory_date) DESC`,
-      [storeId]
-    );
-
-    res.json({ success: true, data: inventories });
-  } catch (error) {
-    console.error('Error fetching inventories for ordering:', error);
-    res.status(500).json({ message: 'Error fetching inventories', error: error.message });
+// Verificar configuración
+transporter.verify((error, success) => {
+  if (error) {
+    console.error('❌ Email configuration error:', error);
+  } else {
+    console.log('✅ Email server ready to send messages');
   }
+});
+
+// Función auxiliar para escapar HTML
+const escapeHtml = (text) => {
+  if (!text) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/\n/g, '<br>');
 };
 
-// ============================================
-// CALCULATE ORDER SUGGESTIONS
-// ============================================
-const calculateOrderSuggestions = async (req, res) => {
-  try {
-    const { inventoryId, storeId } = req.body;
+/**
+ * Generar HTML para el email de orden - VERSIÓN OPTIMIZADA
+ */
+const generateOrderEmailHTML = (orderData) => {
+  const { order_number, order_date, store_name, vendor_name, items, total_amount, total_items } = orderData;
+  
+  // Limitar a máximo 100 items para mostrar en el email
+  const MAX_ITEMS = 100;
+  const displayItems = items.slice(0, MAX_ITEMS);
+  const hasMoreItems = items.length > MAX_ITEMS;
+  const hiddenItemsCount = items.length - MAX_ITEMS;
+  
+  const itemsHTML = displayItems.map(item => `
+      <tr style="border-bottom: 1px solid #e2e8f0;">
+        <td style="padding: 8px 12px;">${escapeHtml(item.product_code || '-')}</td>
+        <td style="padding: 8px 12px;">${escapeHtml(item.product_name)}</td>
+        <td style="padding: 8px 12px; text-align: center;">${item.actual_order}</td>
+        <td style="padding: 8px 12px; text-align: center;">${escapeHtml(item.order_by || 'Unit')}</td>
+      </tr>
+  `).join('');
 
-    if (!inventoryId || !storeId) {
-      return res.status(400).json({ message: 'Inventory ID and Store ID are required' });
-    }
+  const formattedDate = order_date ? new Date(order_date).toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  }) : 'N/A';
 
-    // 1. Obtener todos los productos del store con sus vendors y categoría
-    const [productsWithVendors] = await pool.execute(
-      `SELECT 
-        p.id_products,
-        p.product_name,
-        p.product_code,
-        p.container_size,
-        p.container_unit,
-        p.wholesale_price,
-        p.case_size,
-        pbs.par,
-        pbs.reorder_point,
-        pbs.order_by_the as order_by,
-        v.id_vendors,
-        v.vendor_name,
-        v.email as vendor_email,
-        c.category_name
-      FROM products p
-      INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
-      LEFT JOIN vendors v ON p.id_vendor = v.id_vendors
-      LEFT JOIN categories c ON p.id_category = c.id_categories
-      WHERE pbs.id_store = ?
-      ORDER BY v.vendor_name, c.category_name, p.product_name`,
-      [storeId]
-    );
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Purchase Order ${escapeHtml(order_number)}</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f8fafc;">
+  <div style="max-width: 900px; margin: 0 auto; padding: 20px;">
+    <!-- Header -->
+    <div style="background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%); padding: 30px; border-radius: 12px 12px 0 0; color: white;">
+      <h1 style="margin: 0; font-size: 28px; font-weight: 600;">Purchase Order</h1>
+      <p style="margin: 10px 0 0 0; font-size: 24px; font-weight: 500; opacity: 0.95;">#${escapeHtml(order_number)}</p>
+    </div>
+    
+    <!-- Body -->
+    <div style="background: white; padding: 30px; border-radius: 0 0 12px 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+      <!-- Order Info -->
+      <div style="margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #e2e8f0;">
+        <div style="display: flex; justify-content: space-between; flex-wrap: wrap;">
+          <div style="margin-bottom: 15px;">
+            <strong style="color: #64748b; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">From:</strong>
+            <p style="margin: 5px 0 0 0; font-size: 16px; color: #1e293b; font-weight: 500;">${escapeHtml(store_name)}</p>
+          </div>
+          <div style="margin-bottom: 15px;">
+            <strong style="color: #64748b; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">To:</strong>
+            <p style="margin: 5px 0 0 0; font-size: 16px; color: #1e293b; font-weight: 500;">${escapeHtml(vendor_name)}</p>
+          </div>
+        </div>
+        <div style="display: flex; justify-content: space-between; flex-wrap: wrap; margin-top: 15px;">
+          <div>
+            <strong style="color: #64748b; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Order Date:</strong>
+            <p style="margin: 5px 0 0 0; font-size: 14px; color: #475569;">${formattedDate}</p>
+          </div>
+          <div>
+            <strong style="color: #64748b; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Total Items:</strong>
+            <p style="margin: 5px 0 0 0; font-size: 14px; color: #475569; font-weight: 600;">${total_items || items.length}</p>
+          </div>
+        </div>
+      </div>
 
-    // 2. Suma de stock por fecha exacta del inventario seleccionado
-    const [inventoryStock] = await pool.execute(
-      `SELECT
-        ii.id_product,
-        SUM(
-          CASE
-            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Case', 'Bag', 'Carton') THEN ii.quantity
-            WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb') THEN
-              CASE
-                WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight > 0 THEN
-                  ((ii.quantity - ii.empty_weight) / ii.net_weight)
-                ELSE 0
-              END
-            ELSE 0
-          END
-        ) as stock_on_hand
-      FROM inventory_items ii
-      INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
-      WHERE i.id_store = ?
-        AND i.status = 'Locked'
-        AND DATE(i.inventory_date) = (
-          SELECT DATE(inventory_date)
-          FROM inventories
-          WHERE id_inventories = ?
-        )
-      GROUP BY ii.id_product`,
-      [storeId, inventoryId]
-    );
+      <!-- Items Table -->
+      ${items.length > 0 ? `
+      <div style="overflow-x: auto;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+          <thead>
+            <tr style="background-color: #f8fafc; border-bottom: 2px solid #e2e8f0;">
+              <th style="padding: 12px; text-align: left; font-weight: 600; color: #475569;">Code</th>
+              <th style="padding: 12px; text-align: left; font-weight: 600; color: #475569;">Product</th>
+              <th style="padding: 12px; text-align: center; font-weight: 600; color: #475569;">Quantity</th>
+              <th style="padding: 12px; text-align: center; font-weight: 600; color: #475569;">Unit</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itemsHTML}
+          </tbody>
+        </table>
+      </div>
+      ` : '<p style="text-align: center; color: #64748b;">No items in this order</p>'}
 
-    const stockMap = {};
-    inventoryStock.forEach(item => {
-      stockMap[item.id_product] = parseFloat(item.stock_on_hand);
-    });
+      ${hasMoreItems ? `
+      <div style="margin-top: 20px; padding: 12px; background-color: #fef3c7; border-left: 4px solid #f59e0b; border-radius: 6px;">
+        <p style="margin: 0; color: #92400e; font-size: 13px;">
+          <strong>Note:</strong> This order contains ${hiddenItemsCount} more items not shown in this email.
+          Please log into the system to view the complete order details.
+        </p>
+      </div>
+      ` : ''}
 
-    // 3. Calcular sugerencias por vendor
-    const vendorGroups = {};
+      <!-- Total Amount -->
+      <div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #e2e8f0; text-align: right;">
+        <p style="margin: 0; font-size: 18px; font-weight: 600; color: #0f172a;">
+          Total Amount: <span style="color: #0ea5e9;">$${parseFloat(total_amount || 0).toFixed(2)}</span>
+        </p>
+      </div>
 
-    productsWithVendors.forEach(product => {
-      const vendorId   = product.id_vendors || 'no-vendor';
-      const vendorName = product.vendor_name || 'No Vendor';
+      <!-- Footer Note -->
+      <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; font-size: 13px; color: #475569;">
+        <p style="margin: 0;"><strong>📋 Important:</strong> This is an automated purchase order from our Inventory Management System.</p>
+        <p style="margin: 10px 0 0 0; font-size: 12px;">Please review the order and confirm receipt with an estimated delivery date.</p>
+      </div>
+    </div>
+    
+    <!-- Email Footer -->
+    <div style="text-align: center; margin-top: 20px; padding: 20px; font-size: 12px; color: #94a3b8;">
+      <p style="margin: 5px 0;">This email was sent from ${escapeHtml(store_name)}</p>
+      <p style="margin: 5px 0;">Inventory Management System</p>
+    </div>
+  </div>
+</body>
+</html>`;
+};
 
-      if (!vendorGroups[vendorId]) {
-        vendorGroups[vendorId] = {
-          vendor_id:    product.id_vendors,
-          vendor_name:  vendorName,
-          vendor_email: product.vendor_email,
-          products:     []
-        };
-      }
+/**
+ * Enviar email de orden de compra
+ */
+const sendOrderEmail = async (orderData) => {
+  const { vendor_email, order_number, store_name, items } = orderData;
 
-      const stockOnHand  = stockMap[product.id_products] || 0;
-      const reorderPoint = parseFloat(product.reorder_point) || 0;
-      const par          = parseFloat(product.par) || 0;
-      const caseSize     = parseFloat(product.case_size) || 1;
-
-      // Si order_by es Case, convertir stock a casos para comparar
-      const stockForCalc = product.order_by === 'Case'
-        ? stockOnHand / caseSize
-        : stockOnHand;
-
-      let suggestedOrder = 0;
-      if (stockForCalc <= reorderPoint) {
-        const unitsNeeded = par - stockForCalc;
-        suggestedOrder = product.order_by === 'Case'
-          ? Math.ceil(unitsNeeded / caseSize)
-          : Math.ceil(unitsNeeded);
-        if (suggestedOrder < 0) suggestedOrder = 0;
-      }
-
-      vendorGroups[vendorId].products.push({
-        id_product:    product.id_products,
-        product_name:  product.product_name,
-        product_code:  product.product_code,
-        container_size: product.container_size,
-        container_unit: product.container_unit,
-        category_name: product.category_name || 'Uncategorized',
-        stock_on_hand: product.order_by === 'Case'
-          ? parseFloat((stockOnHand / caseSize).toFixed(2))
-          : stockOnHand,
-        reorder_point: reorderPoint,
-        par,
-        case_size:     caseSize,
-        order_by:      product.order_by,
-        suggested_order: suggestedOrder,
-        actual_order:    suggestedOrder,
-        unit_price: product.case_size && parseFloat(product.case_size) > 0
-          ? parseFloat(product.wholesale_price) / parseFloat(product.case_size)
-          : parseFloat(product.wholesale_price) || 0,
-        is_missing_from_inventory: stockOnHand === 0
-      });
-    });
-
-    res.json({
-      success: true,
-      data: { inventory_id: inventoryId, vendors: Object.values(vendorGroups) }
-    });
-
-  } catch (error) {
-    console.error('Error calculating order suggestions:', error);
-    res.status(500).json({ message: 'Error calculating suggestions', error: error.message });
+  if (!vendor_email) {
+    throw new Error('Vendor email is required');
   }
-};
 
-// ============================================
-// CREATE ORDER
-// ============================================
-const createOrder = async (req, res) => {
-  const connection = await pool.getConnection();
+  console.log(`📧 Preparing email for order ${order_number} to ${vendor_email} with ${items?.length || 0} items`);
+
+  const mailOptions = {
+    from: `"${process.env.EMAIL_FROM_NAME || 'Inventory System'}" <${process.env.EMAIL_USER}>`,
+    to: vendor_email,
+    subject: `Purchase Order ${order_number} from ${store_name}`,
+    html: generateOrderEmailHTML(orderData),
+  };
+
   try {
-    await connection.beginTransaction();
-
-    const { storeId, vendorId, inventoryId, items, notes, createdBy } = req.body;
-
-    if (!storeId || !vendorId || !items || items.length === 0) {
-      return res.status(400).json({ message: 'Missing required fields' });
-    }
-
-    await connection.execute('CALL sp_generate_order_number(?, @order_number)', [storeId]);
-    const [rows] = await connection.execute('SELECT @order_number as order_number');
-    const orderNumber = rows[0];
-
-    let totalItems  = 0;
-    let totalAmount = 0;
-    items.forEach(item => {
-      if (item.actual_order > 0) {
-        totalItems  += 1;
-        totalAmount += item.actual_order * item.unit_price;
-      }
-    });
-
-    const [orderResult] = await connection.execute(
-      `INSERT INTO orders (id_store, id_vendor, id_inventory, order_number, order_date, status, total_items, total_amount, notes, created_by)
-       VALUES (?, ?, ?, ?, NOW(), 'Draft', ?, ?, ?, ?)`,
-      [storeId, vendorId, inventoryId, orderNumber.order_number, totalItems, totalAmount, notes, createdBy]
-    );
-
-    const orderId = orderResult.insertId;
-
-    for (const item of items) {
-      if (item.actual_order > 0) {
-        await connection.execute(
-          `INSERT INTO order_items (id_order, id_product, stock_on_hand, reorder_point, par, suggested_order, actual_order, order_by, unit_price, total_price, is_missing_from_inventory)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [orderId, item.id_product, item.stock_on_hand, item.reorder_point, item.par,
-           item.suggested_order, item.actual_order, item.order_by, item.unit_price,
-           item.actual_order * item.unit_price, item.is_missing_from_inventory]
-        );
-      }
-    }
-
-    await connection.commit();
-    res.json({ success: true, message: 'Order created successfully', data: { order_id: orderId, order_number: orderNumber.order_number } });
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ Email sent successfully: ${info.messageId}`);
+    return { success: true, messageId: info.messageId };
   } catch (error) {
-    await connection.rollback();
-    console.error('Error creating order:', error);
-    res.status(500).json({ message: 'Error creating order', error: error.message });
-  } finally {
-    connection.release();
-  }
-};
-
-// ============================================
-// GET ALL ORDERS
-// ============================================
-const getAllOrders = async (req, res) => {
-  try {
-    const { storeId, status } = req.query;
-    let query = 'SELECT * FROM v_orders_with_details WHERE 1=1';
-    const params = [];
-    if (storeId) { query += ' AND id_stores = ?'; params.push(storeId); }
-    if (status)  { query += ' AND status = ?';    params.push(status); }
-    query += ' ORDER BY order_date DESC';
-    const [orders] = await pool.execute(query, params);
-    res.json({ success: true, data: orders });
-  } catch (error) {
-    console.error('Error fetching orders:', error);
-    res.status(500).json({ message: 'Error fetching orders', error: error.message });
-  }
-};
-
-// ============================================
-// GET ORDER BY ID
-// ============================================
-const getOrderById = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [orders] = await pool.execute('SELECT * FROM v_orders_with_details WHERE id_orders = ?', [id]);
-    if (orders.length === 0) return res.status(404).json({ message: 'Order not found' });
-    const [items] = await pool.execute('SELECT * FROM v_order_items_with_products WHERE id_order = ?', [id]);
-    res.json({ success: true, data: { order: orders[0], items } });
-  } catch (error) {
-    console.error('Error fetching order:', error);
-    res.status(500).json({ message: 'Error fetching order', error: error.message });
-  }
-};
-
-// ============================================
-// SEND ORDER EMAIL - VERSIÓN MEJORADA PARA ÓRDENES GRANDES
-// ============================================
-const sendOrderEmail = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const emailConfig = req.body;
-    
-    console.log(`📧 Sending order ${id} with ${emailConfig.items?.length || 'unknown'} items`);
-    
-    // Obtener la orden con datos básicos
-    const [orders] = await pool.execute('SELECT * FROM v_orders_with_details WHERE id_orders = ?', [id]);
-    if (orders.length === 0) {
-      return res.status(404).json({ message: 'Order not found' });
-    }
-    const order = orders[0];
-    
-    // Obtener items - limitar campos para reducir tamaño
-    const [items] = await pool.execute(
-      `SELECT 
-        oi.actual_order,
-        oi.order_by as unit,
-        oi.unit_price,
-        p.product_name,
-        p.product_code
-       FROM order_items oi
-       INNER JOIN products p ON oi.id_product = p.id_products
-       WHERE oi.id_order = ? AND oi.actual_order > 0
-       ORDER BY p.product_name`,
-      [id]
-    );
-    
-    console.log(`📦 Order ${id} has ${items.length} items to send`);
-    
-    // Preparar datos para el email
-    const emailData = {
-      vendor_email: emailConfig.to || order.vendor_email,
-      order_number: order.order_number,
-      order_date: order.order_date,
-      store_name: order.store_name,
-      vendor_name: order.vendor_name,
-      items: items.map(item => ({
-        product_code: item.product_code || '-',
-        product_name: item.product_name,
-        actual_order: item.actual_order,
-        order_by: item.unit || 'Unit',
-        unit_price: item.unit_price
-      })),
-      total_amount: parseFloat(order.total_amount) || 0,
-      total_items: order.total_items || items.length
-    };
-    
-    // Intentar enviar email
-    await sendEmail(emailData);
-    
-    // Actualizar estado de la orden
-    await pool.execute('UPDATE orders SET status = ?, sent_at = NOW() WHERE id_orders = ?', ['Sent', id]);
-    
-    console.log(`✅ Order ${id} sent successfully with ${items.length} items`);
-    
-    res.json({ 
-      success: true, 
-      message: `Order email sent successfully to ${emailData.vendor_email}`,
-      items_count: items.length,
-      order_number: order.order_number
-    });
-    
-  } catch (error) {
-    console.error('❌ Error sending order email:', error);
-    
-    // Manejar específicamente error 413 (Payload Too Large)
-    if (error.message?.toLowerCase().includes('payload') || 
-        error.message?.toLowerCase().includes('413') ||
-        error.message?.toLowerCase().includes('large')) {
-      return res.status(413).json({ 
-        success: false,
-        message: 'Order has too many items to send via email. Consider splitting the order or using a different method.',
-        error: 'Payload too large',
-        items_count: req.body.items?.length || 'unknown'
-      });
-    }
-    
-    res.status(500).json({ 
-      success: false,
-      message: 'Error sending email', 
-      error: error.message 
-    });
-  }
-};
-
-// ============================================
-// HELPER — normalizar fecha a string YYYY-MM-DD
-// ============================================
-const toDateString = (val) => {
-  if (!val) return null;
-  if (val instanceof Date) return val.toISOString().split('T')[0];
-  return String(val).split('T')[0];
-};
-
-// ============================================
-// GET AVAILABLE DATES FOR VIEW ORDERS SELECTOR
-// ============================================
-const getOrderDates = async (req, res) => {
-  try {
-    const { storeId, filterType } = req.query;
-
-    if (!storeId) {
-      return res.status(400).json({ message: 'Store ID is required' });
-    }
-
-    let query;
-    if (filterType === 'inventory_date') {
-      query = `
-        SELECT 
-          DATE(i.inventory_date) as date,
-          COUNT(DISTINCT o.id_orders) as order_count
-        FROM orders o
-        LEFT JOIN inventories i ON o.id_inventory = i.id_inventories
-        WHERE o.id_store = ?
-          AND o.status IN ('Sent', 'Received')
-          AND i.inventory_date IS NOT NULL
-        GROUP BY DATE(i.inventory_date)
-        ORDER BY DATE(i.inventory_date) DESC
-      `;
-    } else {
-      query = `
-        SELECT 
-          DATE(o.sent_at) as date,
-          COUNT(DISTINCT o.id_orders) as order_count
-        FROM orders o
-        WHERE o.id_store = ?
-          AND o.status IN ('Sent', 'Received')
-          AND o.sent_at IS NOT NULL
-        GROUP BY DATE(o.sent_at)
-        ORDER BY DATE(o.sent_at) DESC
-      `;
-    }
-
-    const [dates] = await pool.execute(query, [storeId]);
-
-    const formatted = dates.map(d => ({ ...d, date: toDateString(d.date) }));
-
-    res.json({ success: true, data: formatted });
-  } catch (error) {
-    console.error('Error fetching order dates:', error);
-    res.status(500).json({ message: 'Error fetching dates', error: error.message });
-  }
-};
-
-// ============================================
-// GET ORDERS FOR VIEW
-// ============================================
-const getOrdersForView = async (req, res) => {
-  try {
-    const { storeId, filterType, filterDate } = req.query;
-
-    if (!storeId) {
-      return res.status(400).json({ message: 'Store ID is required' });
-    }
-
-    let query = `
-      SELECT 
-        o.id_orders,
-        o.order_number,
-        o.order_date,
-        o.sent_at,
-        o.status,
-        o.total_items,
-        o.total_amount,
-        v.vendor_name,
-        v.email as vendor_email,
-        DATE(i.inventory_date) as inventory_date
-      FROM orders o
-      INNER JOIN vendors v ON o.id_vendor = v.id_vendors
-      LEFT JOIN inventories i ON o.id_inventory = i.id_inventories
-      WHERE o.id_store = ?
-        AND o.status IN ('Sent', 'Received')
-    `;
-
-    const params = [storeId];
-
-    if (filterDate) {
-      const cleanDate = toDateString(filterDate);
-      if (filterType === 'inventory_date') {
-        query += ` AND DATE(i.inventory_date) = ?`;
-      } else {
-        query += ` AND DATE(o.sent_at) = ?`;
-      }
-      params.push(cleanDate);
-    }
-
-    query += ` ORDER BY o.sent_at DESC`;
-
-    const [orders] = await pool.execute(query, params);
-
-    const ordersWithItems = await Promise.all(orders.map(async (order) => {
-      const [items] = await pool.execute(
-        `SELECT 
-          oi.actual_order as quantity,
-          oi.order_by as unit,
-          p.product_name,
-          p.product_code
-         FROM order_items oi
-         INNER JOIN products p ON oi.id_product = p.id_products
-         WHERE oi.id_order = ? AND oi.actual_order > 0
-         ORDER BY p.product_name`,
-        [order.id_orders]
-      );
-      return { ...order, inventory_date: toDateString(order.inventory_date), items };
-    }));
-
-    res.json({ success: true, orders: ordersWithItems });
-  } catch (error) {
-    console.error('Error fetching orders for view:', error);
-    res.status(500).json({ message: 'Error fetching orders', error: error.message });
+    console.error('❌ Email send error:', error.message);
+    throw error;
   }
 };
 
 module.exports = {
-  getInventoriesForOrdering,
-  calculateOrderSuggestions,
-  createOrder,
-  getAllOrders,
-  getOrderById,
   sendOrderEmail,
-  getOrderDates,
-  getOrdersForView
 };
