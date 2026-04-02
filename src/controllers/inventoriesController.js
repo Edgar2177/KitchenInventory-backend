@@ -60,10 +60,10 @@ const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmp
 const validateInventoryItems = (items) => {
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (!item.quantity || parseFloat(item.quantity) <= 0) {
+    if (item.quantity === null || item.quantity === undefined || item.quantity === '') {
       return {
         valid: false,
-        message: `La cantidad debe ser mayor a 0 para ${item.productName || 'producto ' + (i + 1)}`
+        message: `Please enter a quantity for ${item.productName || 'product ' + (i + 1)}`
       };
     }
   }
@@ -130,7 +130,7 @@ const getAllInventories = async (req, res) => {
     const [inventories] = await pool.execute(query, params);
     res.json({ success: true, data: inventories });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al obtener los inventarios', error: error.message });
+    res.status(500).json({ success: false, message: 'Error fetching inventories', error: error.message });
   }
 };
 
@@ -148,7 +148,7 @@ const getInventoryById = async (req, res) => {
     );
 
     if (inventory.length === 0) {
-      return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
+      return res.status(404).json({ success: false, message: 'Inventory not found' });
     }
 
     const [items] = await pool.execute(
@@ -183,7 +183,7 @@ const getInventoryById = async (req, res) => {
 
     res.json({ success: true, data: { ...inventory[0], items, losses } });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al obtener el inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error fetching inventory', error: error.message });
   }
 };
 
@@ -221,7 +221,7 @@ const getAvailableProducts = async (req, res) => {
 
     res.json({ success: true, data: products });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al obtener productos disponibles', error: error.message });
+    res.status(500).json({ success: false, message: 'Error fetching available products', error: error.message });
   }
 };
 
@@ -234,25 +234,25 @@ const createInventory = async (req, res) => {
 
     if (!storeId || !inventoryDate) {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'La tienda y fecha son requeridos' });
+      return res.status(400).json({ success: false, message: 'Store and date are required' });
     }
 
     const status = req.body.status || 'Open';
     if (status === 'Locked' && (!items || items.length === 0)) {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'Debe agregar al menos un producto antes de cerrar el inventario' });
+      return res.status(400).json({ success: false, message: 'Please add at least one product before closing the inventory' });
     }
 
     if (!locationId) {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'La ubicación es requerida' });
+      return res.status(400).json({ success: false, message: 'Location is required' });
     }
 
     if (status === 'Locked') {
       const activeInventoryId = await checkActiveInventory(locationId);
       if (activeInventoryId) {
         await connection.rollback();
-        return res.status(400).json({ success: false, message: 'Ya existe un inventario activo para esta ubicación. Por favor, ciérrelo antes de crear uno nuevo.' });
+        return res.status(400).json({ success: false, message: 'There is already an active inventory for this location. Please close it before creating a new one.' });
       }
     }
 
@@ -335,10 +335,10 @@ const createInventory = async (req, res) => {
     );
 
     await connection.commit();
-    res.status(201).json({ success: true, message: 'Inventario creado exitosamente', data: { id: inventoryId, totalWsValue, totalWasteValue } });
+    res.status(201).json({ success: true, message: 'Inventory created successfully', data: { id: inventoryId, totalWsValue, totalWasteValue } });
   } catch (error) {
     await connection.rollback();
-    res.status(500).json({ success: false, message: 'Error al crear el inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error creating inventory', error: error.message });
   } finally {
     connection.release();
   }
@@ -359,19 +359,19 @@ const updateInventory = async (req, res) => {
 
     if (inventory.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
+      return res.status(404).json({ success: false, message: 'Inventory not found' });
     }
 
     if (inventory[0].status === 'Locked') {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'No se puede editar un inventario bloqueado' });
+      return res.status(400).json({ success: false, message: 'Cannot edit a locked inventory' });
     }
 
     if (locationId && locationId !== inventory[0].id_location) {
       const activeInventoryId = await checkActiveInventory(locationId, id);
       if (activeInventoryId) {
         await connection.rollback();
-        return res.status(400).json({ success: false, message: 'Ya existe un inventario activo para esta ubicación' });
+        return res.status(400).json({ success: false, message: 'There is already an active inventory for this location' });
       }
     }
 
@@ -431,10 +431,10 @@ const updateInventory = async (req, res) => {
     }
 
     await connection.commit();
-    res.json({ success: true, message: 'Inventario actualizado exitosamente' });
+    res.json({ success: true, message: 'Inventory updated successfully' });
   } catch (error) {
     await connection.rollback();
-    res.status(500).json({ success: false, message: 'Error al actualizar el inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error updating inventory', error: error.message });
   } finally {
     connection.release();
   }
@@ -445,13 +445,13 @@ const deleteInventory = async (req, res) => {
     const { id } = req.params;
     const [inventory] = await pool.execute('SELECT status FROM inventories WHERE id_inventories = ?', [id]);
 
-    if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
-    if (inventory[0].status === 'Locked') return res.status(400).json({ success: false, message: 'No se puede eliminar un inventario bloqueado' });
+    if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventory not found' });
+    if (inventory[0].status === 'Locked') return res.status(400).json({ success: false, message: 'Cannot delete a locked inventory' });
 
     await pool.execute('DELETE FROM inventories WHERE id_inventories = ?', [id]);
     res.json({ success: true, message: 'Inventario eliminado exitosamente' });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al eliminar el inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error deleting inventory', error: error.message });
   }
 };
 
@@ -460,18 +460,18 @@ const toggleLockInventory = async (req, res) => {
     const { id } = req.params;
     const [inventory] = await pool.execute('SELECT status FROM inventories WHERE id_inventories = ?', [id]);
 
-    if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventario no encontrado' });
+    if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventory not found' });
 
     const newStatus = inventory[0].status === 'Locked' ? 'Unlocked' : 'Locked';
     await pool.execute('UPDATE inventories SET status = ? WHERE id_inventories = ?', [newStatus, id]);
 
     res.json({
       success: true,
-      message: `Inventario ${newStatus === 'Locked' ? 'bloqueado' : 'desbloqueado'} exitosamente`,
+      message: `Inventory ${newStatus === 'Locked' ? 'locked' : 'unlocked'} successfully`,
       data: { status: newStatus }
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al actualizar el estado del inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error updating inventory status', error: error.message });
   }
 };
 
@@ -485,7 +485,7 @@ const reorderInventoryItems = async (req, res) => {
     const [inventory] = await connection.execute('SELECT status FROM inventories WHERE id_inventories = ?', [id]);
     if (inventory.length === 0 || inventory[0].status === 'Locked') {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'No se puede reordenar un inventario bloqueado' });
+      return res.status(400).json({ success: false, message: 'Cannot reorder a locked inventory' });
     }
 
     for (const item of itemOrders) {
@@ -496,10 +496,10 @@ const reorderInventoryItems = async (req, res) => {
     }
 
     await connection.commit();
-    res.json({ success: true, message: 'Orden actualizado exitosamente' });
+    res.json({ success: true, message: 'Order updated successfully' });
   } catch (error) {
     await connection.rollback();
-    res.status(500).json({ success: false, message: 'Error al reordenar items del inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error reordering inventory items', error: error.message });
   } finally {
     connection.release();
   }
@@ -508,7 +508,7 @@ const reorderInventoryItems = async (req, res) => {
 const getLastInventoryProducts = async (req, res) => {
   try {
     const { locationId } = req.params;
-    if (!locationId) return res.status(400).json({ success: false, message: 'locationId es requerido' });
+    if (!locationId) return res.status(400).json({ success: false, message: 'locationId is required' });
 
     const [lastInventory] = await pool.execute(
       `SELECT id_inventories FROM inventories WHERE id_location = ? ORDER BY id_inventories DESC LIMIT 1`,
@@ -516,7 +516,7 @@ const getLastInventoryProducts = async (req, res) => {
     );
 
     if (lastInventory.length === 0) {
-      return res.json({ success: true, data: [], message: 'No hay inventarios previos para esta ubicación' });
+      return res.json({ success: true, data: [], message: 'No previous inventories found for this location' });
     }
 
     const lastInventoryId = lastInventory[0].id_inventories;
@@ -547,7 +547,7 @@ const getLastInventoryProducts = async (req, res) => {
 
     res.json({ success: true, data: items, lastInventoryId });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al obtener productos del último inventario', error: error.message });
+    res.status(500).json({ success: false, message: 'Error fetching last inventory products', error: error.message });
   }
 };
 
@@ -611,7 +611,7 @@ const importInventoryFromExcel = async (req, res) => {
       const quantity = parseFloat(row['Closing Inv']) || 0;
 
       // Omitir productos sin cantidad
-      if (quantity <= 0) {
+      if (quantity === null || quantity === undefined || isNaN(quantity)) {
         skipped++;
         continue;
       }
@@ -663,7 +663,7 @@ const importInventoryFromExcel = async (req, res) => {
         const weightType = containerTypeExcel || productRow.container_type || 'Bottle';
 
         // Calcular wholesale value
-        const containerTypes = ['Bottle', 'Keg', 'Can', 'Each', 'Case', 'Bag', 'Carton'];
+        const containerTypes = ['Bottle', 'Keg', 'Can', 'Each', 'Box', 'Bag', 'Carton'];
         let wholesaleValue = 0;
         if (productRow.wholesale_price) {
           const price    = parseFloat(productRow.wholesale_price);

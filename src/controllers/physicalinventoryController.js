@@ -85,6 +85,9 @@ const getPhysicalInventoryById = async (req, res) => {
         p.id_products,
         p.product_name,
         p.product_code,
+        p.container_size,
+        p.container_unit,
+        p.container_type,
         p.wholesale_price,
         c.category_name
        FROM products p
@@ -112,7 +115,7 @@ const getPhysicalInventoryById = async (req, res) => {
         ii.id_product,
         SUM(
           CASE
-            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each') THEN ii.quantity
+            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
             WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb') THEN
               CASE
                 WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight > 0
@@ -151,6 +154,9 @@ const getPhysicalInventoryById = async (req, res) => {
       product_code: p.product_code,
       category_name: p.category_name,
       wholesale_price: p.wholesale_price || 0,
+      container_size: p.container_size || null,
+      container_unit: p.container_unit || '',
+      container_type: p.container_type || '',
       last_inv_quantity: lastInvMap[p.id_products] ?? 0,
       inv_quantity: savedMap[p.id_products] ?? null,
       display_order: i + 1
@@ -178,6 +184,9 @@ const getProductsForPhysicalInventory = async (req, res) => {
         p.product_name,
         p.product_code,
         p.wholesale_price,
+        p.container_size,
+        p.container_unit,
+        p.container_type,
         c.category_name,
         c.id_categories
        FROM products p
@@ -197,7 +206,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
         ii.id_product,
         SUM(
           CASE
-            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each') THEN ii.quantity
+            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
             WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb') THEN
               CASE
                 WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight > 0
@@ -234,7 +243,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
 
     res.json({ success: true, data: result });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error al obtener productos para inventario físico', error: error.message });
+    res.status(500).json({ success: false, message: 'Error retrieving products for physical inventory', error: error.message });
   }
 };
 
@@ -268,7 +277,7 @@ const createPhysicalInventory = async (req, res) => {
     );
     const inventoryId = result.insertId;
 
-    let displayOrder = 1;
+    let displayOrder = 1; 
     for (const item of items) {
       const qty = parseFloat(item.inv_quantity) || 0;
       const price = parseFloat(item.wholesale_price) || 0;

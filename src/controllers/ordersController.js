@@ -1,4 +1,5 @@
 const pool = require('../config/database');
+const { sendOrderEmail: sendEmail } = require('../services/emailService');
 
 // ============================================
 // GET INVENTORIES FOR SELECTOR
@@ -45,7 +46,7 @@ const calculateOrderSuggestions = async (req, res) => {
       return res.status(400).json({ message: 'Inventory ID and Store ID are required' });
     }
 
-    // 1. Obtener todos los productos del store con sus vendors
+    // 1. Obtener todos los productos del store con sus vendors y categoría
     const [productsWithVendors] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -60,12 +61,14 @@ const calculateOrderSuggestions = async (req, res) => {
         pbs.order_by_the as order_by,
         v.id_vendors,
         v.vendor_name,
-        v.email as vendor_email
+        v.email as vendor_email,
+        c.category_name
       FROM products p
       INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
       LEFT JOIN vendors v ON p.id_vendor = v.id_vendors
+      LEFT JOIN categories c ON p.id_category = c.id_categories
       WHERE pbs.id_store = ?
-      ORDER BY v.vendor_name, p.product_name`,
+      ORDER BY v.vendor_name, c.category_name, p.product_name`,
       [storeId]
     );
 
@@ -75,7 +78,7 @@ const calculateOrderSuggestions = async (req, res) => {
         ii.id_product,
         SUM(
           CASE
-            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each') THEN ii.quantity
+            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
             WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb') THEN
               CASE
                 WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight > 0 THEN
@@ -107,47 +110,53 @@ const calculateOrderSuggestions = async (req, res) => {
     const vendorGroups = {};
 
     productsWithVendors.forEach(product => {
-      const vendorId = product.id_vendors || 'no-vendor';
-      const vendorName = product.vendor_name || 'Sin Vendor';
+      const vendorId   = product.id_vendors || 'no-vendor';
+      const vendorName = product.vendor_name || 'No Vendor';
 
       if (!vendorGroups[vendorId]) {
         vendorGroups[vendorId] = {
-          vendor_id: product.id_vendors,
-          vendor_name: vendorName,
+          vendor_id:    product.id_vendors,
+          vendor_name:  vendorName,
           vendor_email: product.vendor_email,
-          products: []
+          products:     []
         };
       }
 
-      const stockOnHand = stockMap[product.id_products] || 0;
+      const stockOnHand  = stockMap[product.id_products] || 0;
       const reorderPoint = parseFloat(product.reorder_point) || 0;
-      const par = parseFloat(product.par) || 0;
-      const caseSize = parseFloat(product.case_size) || 1;
+      const par          = parseFloat(product.par) || 0;
+      const caseSize     = parseFloat(product.case_size) || 1;
 
+      // Si order_by es Case, convertir stock a casos para comparar
       const stockForCalc = product.order_by === 'Case'
         ? stockOnHand / caseSize
         : stockOnHand;
 
       let suggestedOrder = 0;
-      if (stockOnHand <= reorderPoint) {
-        suggestedOrder = Math.ceil(par - stockOnHand);
+      if (stockForCalc <= reorderPoint) {
+        const unitsNeeded = par - stockForCalc;
+        suggestedOrder = product.order_by === 'Case'
+          ? Math.ceil(unitsNeeded / caseSize)
+          : Math.ceil(unitsNeeded);
         if (suggestedOrder < 0) suggestedOrder = 0;
       }
 
       vendorGroups[vendorId].products.push({
-        id_product: product.id_products,
-        product_name: product.product_name,
-        product_code: product.product_code,
+        id_product:    product.id_products,
+        product_name:  product.product_name,
+        product_code:  product.product_code,
         container_size: product.container_size,
         container_unit: product.container_unit,
+        category_name: product.category_name || 'Uncategorized',
         stock_on_hand: product.order_by === 'Case'
           ? parseFloat((stockOnHand / caseSize).toFixed(2))
           : stockOnHand,
         reorder_point: reorderPoint,
-        par: par,
-        order_by: product.order_by,
+        par,
+        case_size:     caseSize,
+        order_by:      product.order_by,
         suggested_order: suggestedOrder,
-        actual_order: suggestedOrder,
+        actual_order:    suggestedOrder,
         unit_price: product.case_size && parseFloat(product.case_size) > 0
           ? parseFloat(product.wholesale_price) / parseFloat(product.case_size)
           : parseFloat(product.wholesale_price) || 0,
@@ -184,11 +193,11 @@ const createOrder = async (req, res) => {
     const [rows] = await connection.execute('SELECT @order_number as order_number');
     const orderNumber = rows[0];
 
-    let totalItems = 0;
+    let totalItems  = 0;
     let totalAmount = 0;
     items.forEach(item => {
       if (item.actual_order > 0) {
-        totalItems += 1;
+        totalItems  += 1;
         totalAmount += item.actual_order * item.unit_price;
       }
     });
@@ -260,36 +269,92 @@ const getOrderById = async (req, res) => {
 };
 
 // ============================================
-// SEND ORDER EMAIL
+// SEND ORDER EMAIL - VERSIÓN MEJORADA PARA ÓRDENES GRANDES
 // ============================================
-const { sendOrderEmail: sendEmail } = require('../services/emailService');
-
 const sendOrderEmail = async (req, res) => {
   try {
     const { id } = req.params;
     const emailConfig = req.body;
+    
+    console.log(`📧 Sending order ${id} with ${emailConfig.items?.length || 'unknown'} items`);
+    
+    // Obtener la orden con datos básicos
     const [orders] = await pool.execute('SELECT * FROM v_orders_with_details WHERE id_orders = ?', [id]);
-    if (orders.length === 0) return res.status(404).json({ message: 'Order not found' });
+    if (orders.length === 0) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
     const order = orders[0];
+    
+    // Obtener items - limitar campos para reducir tamaño
     const [items] = await pool.execute(
-      'SELECT * FROM v_order_items_with_products WHERE id_order = ? AND actual_order > 0 ORDER BY product_name',
+      `SELECT 
+        oi.actual_order,
+        oi.order_by as unit,
+        oi.unit_price,
+        p.product_name,
+        p.product_code
+       FROM order_items oi
+       INNER JOIN products p ON oi.id_product = p.id_products
+       WHERE oi.id_order = ? AND oi.actual_order > 0
+       ORDER BY p.product_name`,
       [id]
     );
+    
+    console.log(`📦 Order ${id} has ${items.length} items to send`);
+    
+    // Preparar datos para el email
     const emailData = {
       vendor_email: emailConfig.to || order.vendor_email,
       order_number: order.order_number,
       order_date: order.order_date,
       store_name: order.store_name,
       vendor_name: order.vendor_name,
-      items,
-      total_amount: order.total_amount
+      items: items.map(item => ({
+        product_code: item.product_code || '-',
+        product_name: item.product_name,
+        actual_order: item.actual_order,
+        order_by: item.unit || 'Unit',
+        unit_price: item.unit_price
+      })),
+      total_amount: parseFloat(order.total_amount) || 0,
+      total_items: order.total_items || items.length
     };
+    
+    // Intentar enviar email
     await sendEmail(emailData);
+    
+    // Actualizar estado de la orden
     await pool.execute('UPDATE orders SET status = ?, sent_at = NOW() WHERE id_orders = ?', ['Sent', id]);
-    res.json({ success: true, message: `Order email sent successfully to ${emailData.vendor_email}` });
+    
+    console.log(`✅ Order ${id} sent successfully with ${items.length} items`);
+    
+    res.json({ 
+      success: true, 
+      message: `Order email sent successfully to ${emailData.vendor_email}`,
+      items_count: items.length,
+      order_number: order.order_number
+    });
+    
   } catch (error) {
-    console.error('Error sending order email:', error);
-    res.status(500).json({ message: 'Error sending email', error: error.message });
+    console.error('❌ Error sending order email:', error);
+    
+    // Manejar específicamente error 413 (Payload Too Large)
+    if (error.message?.toLowerCase().includes('payload') || 
+        error.message?.toLowerCase().includes('413') ||
+        error.message?.toLowerCase().includes('large')) {
+      return res.status(413).json({ 
+        success: false,
+        message: 'Order has too many items to send via email. Consider splitting the order or using a different method.',
+        error: 'Payload too large',
+        items_count: req.body.items?.length || 'unknown'
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false,
+      message: 'Error sending email', 
+      error: error.message 
+    });
   }
 };
 
@@ -343,11 +408,7 @@ const getOrderDates = async (req, res) => {
 
     const [dates] = await pool.execute(query, [storeId]);
 
-    // Normalizar fechas a string YYYY-MM-DD para evitar problemas de timezone
-    const formatted = dates.map(d => ({
-      ...d,
-      date: toDateString(d.date)
-    }));
+    const formatted = dates.map(d => ({ ...d, date: toDateString(d.date) }));
 
     res.json({ success: true, data: formatted });
   } catch (error) {
@@ -389,7 +450,6 @@ const getOrdersForView = async (req, res) => {
     const params = [storeId];
 
     if (filterDate) {
-      // Truncar la fecha por si viene con timezone desde el frontend
       const cleanDate = toDateString(filterDate);
       if (filterType === 'inventory_date') {
         query += ` AND DATE(i.inventory_date) = ?`;
@@ -403,7 +463,6 @@ const getOrdersForView = async (req, res) => {
 
     const [orders] = await pool.execute(query, params);
 
-    // Obtener items de cada orden y normalizar fechas
     const ordersWithItems = await Promise.all(orders.map(async (order) => {
       const [items] = await pool.execute(
         `SELECT 
@@ -417,11 +476,7 @@ const getOrdersForView = async (req, res) => {
          ORDER BY p.product_name`,
         [order.id_orders]
       );
-      return {
-        ...order,
-        inventory_date: toDateString(order.inventory_date),
-        items
-      };
+      return { ...order, inventory_date: toDateString(order.inventory_date), items };
     }));
 
     res.json({ success: true, orders: ordersWithItems });

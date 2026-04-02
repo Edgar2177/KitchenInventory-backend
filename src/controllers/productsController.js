@@ -5,7 +5,7 @@ const { convertToBaseUnit } = require('../utils/unitConversions');
 const getBaseUnitLabel = (unit) => {
   const volumeUnits = ['ml', 'L', 'Gallon', 'fl oz'];
   const weightUnits = ['g', 'kg', 'lb', 'oz'];
-  const countUnits = ['Each', 'Bottle', 'Keg', 'Can', 'Case', 'Bag', 'Carton'];
+  const countUnits = ['Each', 'Bottle', 'Keg', 'Can', 'Box', 'Bag', 'Carton'];
   
   if (volumeUnits.includes(unit)) return 'ml';
   if (weightUnits.includes(unit)) return 'g';
