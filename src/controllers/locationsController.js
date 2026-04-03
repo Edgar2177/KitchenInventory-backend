@@ -28,7 +28,8 @@ const checkDuplicateName = async (storeId, name, excludeId = null) => {
 // Obtener todas las ubicaciones
 const getAllLocations = async (req, res) => {
   try {
-    const query = `
+    const { storeId } = req.query;
+    let query = `
       SELECT 
         l.id_locations AS id,
         l.location_name AS name,
@@ -37,18 +38,18 @@ const getAllLocations = async (req, res) => {
         s.store_name AS storeName
       FROM locations l
       INNER JOIN stores s ON l.id_store = s.id_stores
-      ORDER BY s.store_name, l.location_name
     `;
-
-    const [rows] = await pool.execute(query);
+    const params = [];
+    if (storeId) {
+      query += ' WHERE l.id_store = ?';
+      params.push(storeId);
+    }
+    query += ' ORDER BY l.location_name';
+    const [rows] = await pool.execute(query, params);
     res.json({ success: true, data: rows });
   } catch (error) {
     console.error('Error getting locations:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error retrieving locations',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error retrieving locations', error: error.message });
   }
 };
 

@@ -121,45 +121,49 @@ const calculateOrderSuggestions = async (req, res) => {
           products:     []
         };
       }
-
-      const stockOnHand  = stockMap[product.id_products] || 0;
-      const reorderPoint = parseFloat(product.reorder_point) || 0;
-      const par          = parseFloat(product.par) || 0;
-      const caseSize     = parseFloat(product.case_size) || 1;
-
-      // Si order_by es Case, convertir stock a casos para comparar
-      const stockForCalc = product.order_by === 'Case'
-        ? stockOnHand / caseSize
-        : stockOnHand;
-
+    
+      const stockOnHand    = stockMap[product.id_products] || 0;
+      const reorderPoint   = parseFloat(product.reorder_point) || 0;
+      const par            = parseFloat(product.par) || 0;
+      const caseSize       = parseFloat(product.case_size) || 1;
+      const orderBy        = product.order_by || product.container_type;
+      const isOrderByCase  = orderBy === 'Case';
+          
+      // Convertir par y reorder a cajas si order_by = Case
+      const parForCalc      = isOrderByCase ? par / caseSize          : par;
+      const reorderForCalc  = isOrderByCase ? reorderPoint / caseSize  : reorderPoint;
+      const stockForCalc    = isOrderByCase ? stockOnHand / caseSize   : stockOnHand;
+          
+      // Precio
+      const wholesalePrice = parseFloat(product.wholesale_price) || 0;
+      const unitPrice = isOrderByCase
+        ? wholesalePrice
+        : (caseSize > 0 ? wholesalePrice / caseSize : wholesalePrice);
+          
+      // Sugerido
       let suggestedOrder = 0;
-      if (stockForCalc <= reorderPoint) {
-        const unitsNeeded = par - stockForCalc;
-        suggestedOrder = product.order_by === 'Case'
-          ? Math.ceil(unitsNeeded / caseSize)
-          : Math.ceil(unitsNeeded);
+      if (stockForCalc <= reorderForCalc) {
+        const unitsNeeded = parForCalc - stockForCalc;
+        suggestedOrder = Math.ceil(unitsNeeded);
         if (suggestedOrder < 0) suggestedOrder = 0;
       }
-
+      
       vendorGroups[vendorId].products.push({
-        id_product:    product.id_products,
-        product_name:  product.product_name,
-        product_code:  product.product_code,
-        container_size: product.container_size,
-        container_unit: product.container_unit,
-        category_name: product.category_name || 'Uncategorized',
-        stock_on_hand: product.order_by === 'Case'
-          ? parseFloat((stockOnHand / caseSize).toFixed(2))
-          : stockOnHand,
-        reorder_point: reorderPoint,
+        id_product:                product.id_products,
+        product_name:              product.product_name,
+        product_code:              product.product_code,
+        container_size:            product.container_size,
+        container_unit:            product.container_unit,
+        category_name:             product.category_name || 'Uncategorized',
+        stock_on_hand:             parseFloat(stockForCalc.toFixed(2)),
+        stock_on_hand_raw:         stockOnHand,
+        reorder_point:             reorderPoint,
         par,
-        case_size:     caseSize,
-        order_by:      product.order_by,
-        suggested_order: suggestedOrder,
-        actual_order:    suggestedOrder,
-        unit_price: product.case_size && parseFloat(product.case_size) > 0
-          ? parseFloat(product.wholesale_price) / parseFloat(product.case_size)
-          : parseFloat(product.wholesale_price) || 0,
+        case_size:                 caseSize,
+        order_by:                  orderBy,
+        suggested_order:           suggestedOrder,
+        actual_order:              0,
+        unit_price:                parseFloat(unitPrice.toFixed(4)),
         is_missing_from_inventory: stockOnHand === 0
       });
     });
@@ -178,6 +182,7 @@ const calculateOrderSuggestions = async (req, res) => {
 // ============================================
 // CREATE ORDER
 // ============================================
+
 const createOrder = async (req, res) => {
   const connection = await pool.getConnection();
   try {
@@ -215,9 +220,19 @@ const createOrder = async (req, res) => {
         await connection.execute(
           `INSERT INTO order_items (id_order, id_product, stock_on_hand, reorder_point, par, suggested_order, actual_order, order_by, unit_price, total_price, is_missing_from_inventory)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [orderId, item.id_product, item.stock_on_hand, item.reorder_point, item.par,
-           item.suggested_order, item.actual_order, item.order_by, item.unit_price,
-           item.actual_order * item.unit_price, item.is_missing_from_inventory]
+          [
+            orderId,
+            item.id_product              ?? null,
+            item.stock_on_hand           ?? 0,
+            item.reorder_point           ?? 0,
+            item.par                     ?? 0,
+            item.suggested_order         ?? 0,
+            item.actual_order            ?? 0,
+            item.order_by                || null,
+            item.unit_price              ?? 0,
+            (item.actual_order * item.unit_price) || 0,
+            item.is_missing_from_inventory ?? false
+          ]
         );
       }
     }
@@ -486,6 +501,18 @@ const getOrdersForView = async (req, res) => {
   }
 };
 
+const deleteOrder = async (req, res) => {
+  try{
+    const {id} = req.params;
+    const [result] = await pool.execute('DELETE FROM orders WHERE id_orders = ?', [id]);
+    if (result.affectedRows === 0) return res.status(404).json({ success: false, message: 'Order not found' });
+    res.json({success: true, message: 'Order deleted successfully'});
+  }catch(error){
+    console.error('Error deleting order:', error);
+    res.status(500).json({success: false, message: 'Error deleting order', error: error.message});
+  }
+}
+
 module.exports = {
   getInventoriesForOrdering,
   calculateOrderSuggestions,
@@ -494,5 +521,6 @@ module.exports = {
   getOrderById,
   sendOrderEmail,
   getOrderDates,
-  getOrdersForView
+  getOrdersForView,
+  deleteOrder
 };

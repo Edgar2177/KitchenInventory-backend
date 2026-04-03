@@ -8,7 +8,8 @@ const {
   getOrderById,
   sendOrderEmail,
   getOrderDates,      
-  getOrdersForView
+  getOrdersForView,
+  deleteOrder
 } = require('../controllers/ordersController');
 
 // GET inventories for selector
@@ -24,7 +25,7 @@ router.get('/view', getOrdersForView);
 router.get('/', getAllOrders);
 router.get('/:id', getOrderById);
 router.post('/', createOrder);
-
+router.delete('/:id', deleteOrder);
 // Send order email to vendor
 router.post('/:id/send-email', sendOrderEmail);
 
