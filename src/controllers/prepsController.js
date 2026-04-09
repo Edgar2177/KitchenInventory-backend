@@ -18,6 +18,9 @@ const getAllPreps = async (req, res) => {
                 p.id_preps as id,
                 p.prep_name as name,
                 p.total_cost as totalCost,
+                p.yield_quantity as yieldQuantity,
+                p.yield_unit as yieldUnit,
+                p.yield_unit_cost as yieldUnitCost,
                 p.created_at as createdAt,
                 COUNT(pi.id_prep_ingredient) as ingredientCount
             FROM preps p
@@ -52,6 +55,9 @@ const getPrepById = async (req, res) => {
                 id_store as storeId,
                 prep_name as name,
                 total_cost as totalCost,
+                yield_quantity as yieldQuantity,
+                yield_unit as yieldUnit,
+                yield_unit_cost as yieldUnitCost,
                 created_at as createdAt
             FROM preps
             WHERE id_preps = ?`, [id]
@@ -105,7 +111,7 @@ const createPrep = async (req, res) => {
     try{
         await connection.beginTransaction();
 
-        const {storeId, name, ingredients} = req.body;
+        const {storeId, name, ingredients, yieldQuantity, yieldUnit} = req.body;
 
         //Validaciones
         if(!storeId) {
@@ -152,10 +158,16 @@ const createPrep = async (req, res) => {
             totalCost += parseFloat(ing.totalCost);
         });
 
+        // Calcular yield_unit_cost
+        const yieldUnitCost = yieldQuantity && parseFloat(yieldQuantity) > 0
+          ? totalCost / parseFloat(yieldQuantity)
+          : null;
+
         //Insertar preparación
         const [result] = await connection.execute(`
-            INSERT INTO preps (id_store, prep_name, total_cost)
-            VALUES (?, ?, ?)`, [storeId, name.trim(), totalCost]
+          INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+          [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost]
         );
         
         const prepId = result.insertId;
@@ -176,6 +188,7 @@ const createPrep = async (req, res) => {
                 ]
             );
         }
+        
 
         await connection.commit();
 
@@ -203,7 +216,7 @@ const updatePrep = async (req, res) => {
     try{
         await connection.beginTransaction();
         const {id} = req.params;
-        const {name, ingredients} = req.body;
+        const {name, ingredients, yieldQuantity, yieldUnit} = req.body;
         
         if(!name || !name.trim()){
             await connection.rollback();
@@ -257,12 +270,17 @@ const updatePrep = async (req, res) => {
             totalCost += parseFloat(ing.totalCost);
         });
 
+        const yieldUnitCost = yieldQuantity && parseFloat(yieldQuantity) > 0
+        ? totalCost / parseFloat(yieldQuantity)
+        : null;
+
         //Actualizar preparación
         await connection.execute(`
             UPDATE preps 
-            SET prep_name = ?, total_cost = ?, updated_at = CURRENT_TIMESTAMP 
+            SET prep_name = ?, total_cost = ?, yield_quantity = ?, yield_unit = ?, 
+            yield_unit_cost = ?, updated_at = CURRENT_TIMESTAMP 
             WHERE id_preps = ?`,
-            [name.trim(), totalCost, id]
+            [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, id]
         );
 
         //Eliminar ingredientes existentes

@@ -5,10 +5,10 @@ const getAllRecipes = async (req, res) => {
   try {
     const { storeId } = req.query;
 
-    if(!storeId){
+    if (!storeId) {
       return res.status(400).json({
         success: false,
-        message: 'storeId is require'
+        message: 'storeId is required'
       });
     }
 
@@ -26,7 +26,7 @@ const getAllRecipes = async (req, res) => {
       WHERE r.id_stores = ?
       GROUP BY r.id_recipes
       ORDER BY r.recipe_name
-    `,[storeId]);
+    `, [storeId]);
 
     res.json({
       success: true,
@@ -42,13 +42,13 @@ const getAllRecipes = async (req, res) => {
   }
 };
 
-// Obtener una receta por ID con sus ingredientes
+// Obtener una receta por ID con sus ingredientes y preparations
 const getRecipeById = async (req, res) => {
   try {
     const { id } = req.params;
     const { storeId } = req.query;
 
-    if (!storeId){
+    if (!storeId) {
       return res.status(400).json({
         success: false,
         message: 'storeId is required'
@@ -74,7 +74,7 @@ const getRecipeById = async (req, res) => {
       });
     }
 
-    // Obtener ingredientes
+    // Obtener ingredientes (solo productos)
     const [ingredients] = await pool.execute(`
       SELECT 
         ri.id_recipe_ingredient as id,
@@ -86,13 +86,33 @@ const getRecipeById = async (req, res) => {
         ri.total_cost as totalCost
       FROM recipe_ingredients ri
       INNER JOIN products p ON ri.id_product = p.id_products
-      WHERE ri.id_recipe = ?
+      WHERE ri.id_recipe = ? AND ri.item_type = 'product'
       ORDER BY p.product_name
+    `, [id]);
+
+    // Obtener preparations (pre-batch)
+    const [preparations] = await pool.execute(`
+      SELECT 
+        ri.id_recipe_ingredient as id,
+        ri.id_prep as prepId,
+        pr.prep_name as prepName,
+        pr.total_cost as prepCost,
+        pr.yield_quantity as baseQuantity,
+        pr.yield_unit as baseUnit,
+        ri.quantity,
+        ri.unit,
+        ri.unit_cost as unitCost,
+        ri.total_cost as totalCost
+      FROM recipe_ingredients ri
+      INNER JOIN preps pr ON ri.id_prep = pr.id_preps
+      WHERE ri.id_recipe = ? AND ri.item_type = 'prep'
+      ORDER BY pr.prep_name
     `, [id]);
 
     const recipe = {
       ...recipes[0],
-      ingredients
+      ingredients,
+      preparations
     };
 
     res.json({
@@ -112,19 +132,21 @@ const getRecipeById = async (req, res) => {
 // Crear receta
 const createRecipe = async (req, res) => {
   const connection = await pool.getConnection();
-  
+
   try {
     await connection.beginTransaction();
 
-    const { storeId, posIdNumber, name, ingredients } = req.body;
+    const { storeId, posIdNumber, name, ingredients, preparations } = req.body;
 
     // Validaciones
-    if(!storeId){
+    if (!storeId) {
+      await connection.rollback();
       return res.status(400).json({
         success: false,
-        message: 'storedId is required'
+        message: 'storeId is required'
       });
     }
+
     if (!name || !name.trim()) {
       await connection.rollback();
       return res.status(400).json({
@@ -133,11 +155,14 @@ const createRecipe = async (req, res) => {
       });
     }
 
-    if (!ingredients || ingredients.length === 0) {
+    const hasIngredients   = ingredients   && ingredients.length   > 0;
+    const hasPreparations  = preparations  && preparations.length  > 0;
+
+    if (!hasIngredients && !hasPreparations) {
       await connection.rollback();
       return res.status(400).json({
         success: false,
-        message: 'At least one ingredient is required'
+        message: 'At least one ingredient or preparation is required'
       });
     }
 
@@ -155,11 +180,10 @@ const createRecipe = async (req, res) => {
       });
     }
 
-    // Calcular costo total
+    // Calcular costo total (ingredientes + preparations)
     let totalCost = 0;
-    ingredients.forEach(ing => {
-      totalCost += parseFloat(ing.totalCost);
-    });
+    (ingredients  || []).forEach(ing  => { totalCost += parseFloat(ing.totalCost)  || 0; });
+    (preparations || []).forEach(prep => { totalCost += parseFloat(prep.totalCost) || 0; });
 
     // Insertar receta
     const [result] = await connection.execute(
@@ -170,12 +194,12 @@ const createRecipe = async (req, res) => {
 
     const recipeId = result.insertId;
 
-    // Insertar ingredientes
-    for (const ingredient of ingredients) {
+    // Insertar ingredientes (productos)
+    for (const ingredient of (ingredients || [])) {
       await connection.execute(
         `INSERT INTO recipe_ingredients 
-         (id_recipe, id_product, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         (id_recipe, id_product, item_type, quantity, unit, unit_cost, total_cost)
+         VALUES (?, ?, 'product', ?, ?, ?, ?)`,
         [
           recipeId,
           ingredient.productId,
@@ -183,6 +207,27 @@ const createRecipe = async (req, res) => {
           ingredient.unit,
           ingredient.unitCost,
           ingredient.totalCost
+        ]
+      );
+    }
+
+    // Insertar preparations (pre-batch)
+    for (const prep of (preparations || [])) {
+      const unitCost = parseFloat(prep.quantity) > 0
+        ? (parseFloat(prep.totalCost) / parseFloat(prep.quantity)).toFixed(6)
+        : 0;
+
+      await connection.execute(
+        `INSERT INTO recipe_ingredients 
+         (id_recipe, id_prep, item_type, quantity, unit, unit_cost, total_cost)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?)`,
+        [
+          recipeId,
+          prep.prepId,
+          prep.quantity,
+          prep.unit || 'Each',
+          unitCost,
+          prep.totalCost
         ]
       );
     }
@@ -210,12 +255,13 @@ const createRecipe = async (req, res) => {
 // Actualizar receta
 const updateRecipe = async (req, res) => {
   const connection = await pool.getConnection();
-  
+
   try {
     await connection.beginTransaction();
 
     const { id } = req.params;
-    const { posIdNumber, name, ingredients } = req.body;
+    // FIX: storeId ahora se extrae del body
+    const { storeId, posIdNumber, name, ingredients, preparations } = req.body;
 
     // Validaciones
     if (!name || !name.trim()) {
@@ -226,18 +272,21 @@ const updateRecipe = async (req, res) => {
       });
     }
 
-    if (!ingredients || ingredients.length === 0) {
+    const hasIngredients  = ingredients  && ingredients.length  > 0;
+    const hasPreparations = preparations && preparations.length > 0;
+
+    if (!hasIngredients && !hasPreparations) {
       await connection.rollback();
       return res.status(400).json({
         success: false,
-        message: 'At least one ingredient is required'
+        message: 'At least one ingredient or preparation is required'
       });
     }
 
-    // Verificar que existe
+    // FIX: verificar que la receta existe (query correcta)
     const [existing] = await connection.execute(
-      'SELECT id_recipes FROM recipes WHERE id_stores = ? AND LOWER(TRIM(recipe_name)) = LOWER(TRIM(?)) AND id_recipes !=?',
-      [storeId, name, id]
+      'SELECT id_stores FROM recipes WHERE id_recipes = ?',
+      [id]
     );
 
     if (existing.length === 0) {
@@ -248,10 +297,10 @@ const updateRecipe = async (req, res) => {
       });
     }
 
-    // Verificar nombre único (excluyendo la receta actual)
+    // FIX: verificar nombre duplicado (excluyendo la receta actual)
     const [duplicate] = await connection.execute(
-      'SELECT id_recipes FROM recipes WHERE LOWER(TRIM(recipe_name)) = LOWER(TRIM(?)) AND id_recipes != ?',
-      [name, id]
+      'SELECT id_recipes FROM recipes WHERE id_stores = ? AND LOWER(TRIM(recipe_name)) = LOWER(TRIM(?)) AND id_recipes != ?',
+      [existing[0].id_stores, name, id]
     );
 
     if (duplicate.length > 0) {
@@ -262,11 +311,10 @@ const updateRecipe = async (req, res) => {
       });
     }
 
-    // Calcular costo total
+    // FIX: calcular costo total incluyendo preparations
     let totalCost = 0;
-    ingredients.forEach(ing => {
-      totalCost += parseFloat(ing.totalCost);
-    });
+    (ingredients  || []).forEach(ing  => { totalCost += parseFloat(ing.totalCost)  || 0; });
+    (preparations || []).forEach(prep => { totalCost += parseFloat(prep.totalCost) || 0; });
 
     // Actualizar receta
     await connection.execute(
@@ -276,18 +324,18 @@ const updateRecipe = async (req, res) => {
       [posIdNumber || null, name.trim(), totalCost, id]
     );
 
-    // Eliminar ingredientes existentes
+    // Eliminar todos los ingredientes existentes (productos y preps)
     await connection.execute(
       'DELETE FROM recipe_ingredients WHERE id_recipe = ?',
       [id]
     );
 
-    // Insertar nuevos ingredientes
-    for (const ingredient of ingredients) {
+    // Insertar ingredientes (productos)
+    for (const ingredient of (ingredients || [])) {
       await connection.execute(
         `INSERT INTO recipe_ingredients 
-         (id_recipe, id_product, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         (id_recipe, id_product, item_type, quantity, unit, unit_cost, total_cost)
+         VALUES (?, ?, 'product', ?, ?, ?, ?)`,
         [
           id,
           ingredient.productId,
@@ -295,6 +343,27 @@ const updateRecipe = async (req, res) => {
           ingredient.unit,
           ingredient.unitCost,
           ingredient.totalCost
+        ]
+      );
+    }
+
+    // Insertar preparations (pre-batch)
+    for (const prep of (preparations || [])) {
+      const unitCost = parseFloat(prep.quantity) > 0
+        ? (parseFloat(prep.totalCost) / parseFloat(prep.quantity)).toFixed(6)
+        : 0;
+
+      await connection.execute(
+        `INSERT INTO recipe_ingredients 
+         (id_recipe, id_prep, item_type, quantity, unit, unit_cost, total_cost)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?)`,
+        [
+          id,
+          prep.prepId,
+          prep.quantity,
+          prep.unit || 'Each',
+          unitCost,
+          prep.totalCost
         ]
       );
     }
@@ -323,8 +392,9 @@ const deleteRecipe = async (req, res) => {
   try {
     const { id } = req.params;
 
+    // FIX: SQL corregido (tenía "AND id_recipes" colgado)
     const [result] = await pool.execute(
-      'DELETE FROM recipes WHERE id_recipes = ? AND id_recipes',
+      'DELETE FROM recipes WHERE id_recipes = ?',
       [id]
     );
 

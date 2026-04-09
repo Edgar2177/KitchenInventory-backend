@@ -12,13 +12,15 @@ const {
   getAvailableProducts,
   reorderInventoryItems,
   getLastInventoryProducts,
-  importInventoryFromExcel 
+  importInventoryFromExcel,
+  getProductsForPrintInventory
 } = require('../controllers/inventoriesController');
 
 // Rutas especiales con path fijo (deben estar ANTES de /:id)
 router.post('/import', upload.single('file'), importInventoryFromExcel);
 router.get('/available-products', getAvailableProducts);
 router.get('/last-products/:locationId', getLastInventoryProducts);
+router.get('/print-format', getProductsForPrintInventory);
 
 
 // Rutas CRUD básicas

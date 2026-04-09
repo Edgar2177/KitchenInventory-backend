@@ -763,6 +763,66 @@ const importInventoryFromExcel = async (req, res) => {
   }
 };
 
+// ========================================
+// GET PRODUCTS FOR PRINT INVENTORY BY LOCATION
+// ========================================
+const getProductsForPrintInventory = async (req, res) => {
+  try {
+    const { storeId, locationId } = req.query;
+    if (!storeId || !locationId) {
+      return res.status(400).json({ success: false, message: 'storeId and locationId are required' });
+    }
+
+    // Último inventario Locked de esa location
+    const [lastInventory] = await pool.execute(
+      `SELECT id_inventories FROM inventories
+       WHERE id_location = ? AND status = 'Locked'
+       ORDER BY inventory_date DESC
+       LIMIT 1`,
+      [locationId]
+    );
+
+    if (lastInventory.length === 0) {
+      return res.json({ success: true, data: [], message: 'No locked inventory found for this location' });
+    }
+
+    // Solo los productos de ese inventario con su cantidad
+    const [items] = await pool.execute(
+      `SELECT 
+        p.id_products,
+        p.product_name,
+        p.product_code,
+        p.container_size,
+        p.container_unit,
+        p.container_type,
+        c.category_name,
+        ROUND(SUM(
+          CASE
+            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
+            WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb') THEN
+              CASE
+                WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight > 0
+                THEN (ii.quantity - ii.empty_weight) / ii.net_weight
+                ELSE 0
+              END
+            ELSE ii.quantity
+          END
+        ), 2) as last_inv_quantity
+       FROM inventory_items ii
+       INNER JOIN products p ON ii.id_product = p.id_products
+       INNER JOIN categories c ON p.id_category = c.id_categories
+       WHERE ii.id_inventory = ?
+       GROUP BY p.id_products
+       ORDER BY c.category_name ASC, p.product_name ASC`,
+      [lastInventory[0].id_inventories]
+    );
+
+    res.json({ success: true, data: items });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Error fetching products for print', error: error.message });
+  }
+};
+
 module.exports = {
   getAllInventories,
   getInventoryById,
@@ -773,5 +833,6 @@ module.exports = {
   getAvailableProducts,
   reorderInventoryItems,
   getLastInventoryProducts,
-  importInventoryFromExcel
+  importInventoryFromExcel,
+  getProductsForPrintInventory
 };
