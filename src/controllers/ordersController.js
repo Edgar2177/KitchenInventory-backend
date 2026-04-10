@@ -36,6 +36,69 @@ const getInventoriesForOrdering = async (req, res) => {
 };
 
 // ============================================
+// HELPERS DE CONVERSIÓN
+// ============================================
+
+// Convierte una cantidad en su unidad original a gramos/ml (base unit)
+const toBaseGrams = (quantity, unit) => {
+  switch (unit) {
+    case 'kg':     return quantity * 1000;
+    case 'oz':     return quantity * 28.3495;
+    case 'lb':     return quantity * 453.592;
+    case 'L':
+    case 'Liter':  return quantity * 1000;
+    case 'Gallon': return quantity * 3785.41;
+    case 'fl oz':  return quantity * 29.5735;
+    case 'g':
+    case 'ml':
+    default:       return quantity;
+  }
+};
+
+// Calcula el stock en unidades de contenedor a partir de los rows de inventory_items
+// Lógica:
+//   - Contables (Bottle, Keg, etc.)    → quantity directamente
+//   - Pesados con full/empty > 0       → porcentaje de llenado (fórmula botella)
+//   - A granel (kg, lb, oz, g, ml, L)  → convierte a base unit y divide entre container_size_base_unit
+const calcStockUnits = (rows, containerSizeBaseUnit) => {
+  let total = 0;
+
+  for (const row of rows) {
+    const qty   = parseFloat(row.quantity)    || 0;
+    const full  = parseFloat(row.full_weight) || 0;
+    const net   = parseFloat(row.net_weight)  || 0;
+    const qtype = row.quantity_type;
+
+    const countUnits = ['Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton'];
+
+    if (countUnits.includes(qtype)) {
+      // Contable directo
+      total += qty;
+
+    } else {
+      // Unidad de peso o volumen
+      const emptyIsReal = (row.empty_weight !== null && row.empty_weight !== undefined);
+      const emptyVal    = emptyIsReal ? parseFloat(row.empty_weight) : 0;
+
+      if (net > 0 && full > 0 && emptyIsReal && emptyVal > 0) {
+        // Botella pesada: calcular porcentaje de llenado
+        const qtyInGrams = toBaseGrams(qty, qtype);
+        const pct = (qtyInGrams - emptyVal) / net;
+        total += Math.max(0, pct);
+
+      } else {
+        // A granel: la cantidad YA es el stock, solo convertir a unidades de contenedor
+        const qtyInGrams = toBaseGrams(qty, qtype);
+        const contBase   = parseFloat(containerSizeBaseUnit) || 1;
+        total += contBase > 0 ? qtyInGrams / contBase : 0;
+      }
+    }
+  }
+
+  return total;
+};
+
+// ============================================
 // CALCULATE ORDER SUGGESTIONS
 // ============================================
 const calculateOrderSuggestions = async (req, res) => {
@@ -46,7 +109,7 @@ const calculateOrderSuggestions = async (req, res) => {
       return res.status(400).json({ message: 'Inventory ID and Store ID are required' });
     }
 
-    // 1. Obtener todos los productos del store con sus vendors y categoría
+    // 1. Obtener todos los productos del store con sus vendors, categoría y container_size_base_unit
     const [productsWithVendors] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -54,6 +117,8 @@ const calculateOrderSuggestions = async (req, res) => {
         p.product_code,
         p.container_size,
         p.container_unit,
+        p.container_size_base_unit,
+        p.container_size_base_unit_type,
         p.wholesale_price,
         p.case_size,
         pbs.par,
@@ -72,22 +137,15 @@ const calculateOrderSuggestions = async (req, res) => {
       [storeId]
     );
 
-    // 2. Suma de stock por fecha exacta del inventario seleccionado
-    const [inventoryStock] = await pool.execute(
+    // 2. Obtener todos los inventory_items de esa fecha (raw, sin calcular stock en SQL)
+    const [inventoryItems] = await pool.execute(
       `SELECT
         ii.id_product,
-        SUM(
-          CASE
-            WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
-            WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb') THEN
-              CASE
-                WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight > 0 THEN
-                  ((ii.quantity - ii.empty_weight) / ii.net_weight)
-                ELSE 0
-              END
-            ELSE 0
-          END
-        ) as stock_on_hand
+        ii.quantity_type,
+        ii.quantity,
+        ii.full_weight,
+        ii.empty_weight,
+        ii.net_weight
       FROM inventory_items ii
       INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
       WHERE i.id_store = ?
@@ -96,17 +154,40 @@ const calculateOrderSuggestions = async (req, res) => {
           SELECT DATE(inventory_date)
           FROM inventories
           WHERE id_inventories = ?
-        )
-      GROUP BY ii.id_product`,
+        )`,
       [storeId, inventoryId]
     );
 
-    const stockMap = {};
-    inventoryStock.forEach(item => {
-      stockMap[item.id_product] = parseFloat(item.stock_on_hand);
+    // Agrupar items por producto (puede haber múltiples ubicaciones)
+    const itemsByProduct = {};
+    inventoryItems.forEach(item => {
+      if (!itemsByProduct[item.id_product]) {
+        itemsByProduct[item.id_product] = [];
+      }
+      itemsByProduct[item.id_product].push(item);
     });
 
-    // 3. Calcular sugerencias por vendor
+    // Set de productos que sí fueron contados en el inventario
+    const countedProductIds = new Set(Object.keys(itemsByProduct).map(Number));
+
+    // Map de productos para lookup rápido
+    const productMap = {};
+    productsWithVendors.forEach(p => {
+      productMap[p.id_products] = p;
+    });
+
+    // 3. Calcular stock en unidades de contenedor por producto
+    const stockMap = {};
+    countedProductIds.forEach(productId => {
+      const rows    = itemsByProduct[productId];
+      const product = productMap[productId];
+      if (!product) return;
+
+      const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
+      stockMap[productId] = calcStockUnits(rows, containerSizeBaseUnit);
+    });
+
+    // 4. Calcular sugerencias por vendor
     const vendorGroups = {};
 
     productsWithVendors.forEach(product => {
@@ -121,25 +202,28 @@ const calculateOrderSuggestions = async (req, res) => {
           products:     []
         };
       }
-    
-      const stockOnHand    = stockMap[product.id_products] || 0;
-      const reorderPoint   = parseFloat(product.reorder_point) || 0;
-      const par            = parseFloat(product.par) || 0;
-      const caseSize       = parseFloat(product.case_size) || 1;
-      const orderBy        = product.order_by || product.container_type;
-      const isOrderByCase  = orderBy === 'Case';
-          
+
+      const stockOnHand  = stockMap[product.id_products] !== undefined
+        ? stockMap[product.id_products]
+        : 0;
+
+      const reorderPoint  = parseFloat(product.reorder_point) || 0;
+      const par           = parseFloat(product.par)           || 0;
+      const caseSize      = parseFloat(product.case_size)     || 1;
+      const orderBy       = product.order_by || product.container_type;
+      const isOrderByCase = orderBy === 'Case';
+
       // Convertir par y reorder a cajas si order_by = Case
-      const parForCalc      = isOrderByCase ? par / caseSize          : par;
-      const reorderForCalc  = isOrderByCase ? reorderPoint / caseSize  : reorderPoint;
-      const stockForCalc    = isOrderByCase ? stockOnHand / caseSize   : stockOnHand;
-          
+      const parForCalc     = isOrderByCase ? par / caseSize          : par;
+      const reorderForCalc = isOrderByCase ? reorderPoint / caseSize  : reorderPoint;
+      const stockForCalc   = isOrderByCase ? stockOnHand / caseSize   : stockOnHand;
+
       // Precio
       const wholesalePrice = parseFloat(product.wholesale_price) || 0;
       const unitPrice = isOrderByCase
         ? wholesalePrice
         : (caseSize > 0 ? wholesalePrice / caseSize : wholesalePrice);
-          
+
       // Sugerido
       let suggestedOrder = 0;
       if (stockForCalc <= reorderForCalc) {
@@ -147,7 +231,7 @@ const calculateOrderSuggestions = async (req, res) => {
         suggestedOrder = Math.ceil(unitsNeeded);
         if (suggestedOrder < 0) suggestedOrder = 0;
       }
-      
+
       vendorGroups[vendorId].products.push({
         id_product:                product.id_products,
         product_name:              product.product_name,
@@ -156,7 +240,7 @@ const calculateOrderSuggestions = async (req, res) => {
         container_unit:            product.container_unit,
         category_name:             product.category_name || 'Uncategorized',
         stock_on_hand:             parseFloat(stockForCalc.toFixed(2)),
-        stock_on_hand_raw:         stockOnHand,
+        stock_on_hand_raw:         parseFloat(stockOnHand.toFixed(4)),
         reorder_point:             reorderPoint,
         par,
         case_size:                 caseSize,
@@ -164,7 +248,7 @@ const calculateOrderSuggestions = async (req, res) => {
         suggested_order:           suggestedOrder,
         actual_order:              0,
         unit_price:                parseFloat(unitPrice.toFixed(4)),
-        is_missing_from_inventory: stockOnHand === 0
+        is_missing_from_inventory: !countedProductIds.has(product.id_products)
       });
     });
 
@@ -182,7 +266,6 @@ const calculateOrderSuggestions = async (req, res) => {
 // ============================================
 // CREATE ORDER
 // ============================================
-
 const createOrder = async (req, res) => {
   const connection = await pool.getConnection();
   try {
@@ -284,23 +367,21 @@ const getOrderById = async (req, res) => {
 };
 
 // ============================================
-// SEND ORDER EMAIL - VERSIÓN MEJORADA PARA ÓRDENES GRANDES
+// SEND ORDER EMAIL
 // ============================================
 const sendOrderEmail = async (req, res) => {
   try {
     const { id } = req.params;
     const emailConfig = req.body;
-    
+
     console.log(`📧 Sending order ${id} with ${emailConfig.items?.length || 'unknown'} items`);
-    
-    // Obtener la orden con datos básicos
+
     const [orders] = await pool.execute('SELECT * FROM v_orders_with_details WHERE id_orders = ?', [id]);
     if (orders.length === 0) {
       return res.status(404).json({ message: 'Order not found' });
     }
     const order = orders[0];
-    
-    // Obtener items - limitar campos para reducir tamaño
+
     const [items] = await pool.execute(
       `SELECT 
         oi.actual_order,
@@ -314,61 +395,57 @@ const sendOrderEmail = async (req, res) => {
        ORDER BY p.product_name`,
       [id]
     );
-    
+
     console.log(`📦 Order ${id} has ${items.length} items to send`);
-    
-    // Preparar datos para el email
+
     const emailData = {
       vendor_email: emailConfig.to || order.vendor_email,
       order_number: order.order_number,
-      order_date: order.order_date,
-      store_name: order.store_name,
-      vendor_name: order.vendor_name,
+      order_date:   order.order_date,
+      store_name:   order.store_name,
+      vendor_name:  order.vendor_name,
       items: items.map(item => ({
         product_code: item.product_code || '-',
         product_name: item.product_name,
         actual_order: item.actual_order,
-        order_by: item.unit || 'Unit',
-        unit_price: item.unit_price
+        order_by:     item.unit || 'Unit',
+        unit_price:   item.unit_price
       })),
       total_amount: parseFloat(order.total_amount) || 0,
-      total_items: order.total_items || items.length
+      total_items:  order.total_items || items.length
     };
-    
-    // Intentar enviar email
+
     await sendEmail(emailData);
-    
-    // Actualizar estado de la orden
+
     await pool.execute('UPDATE orders SET status = ?, sent_at = NOW() WHERE id_orders = ?', ['Sent', id]);
-    
+
     console.log(`✅ Order ${id} sent successfully with ${items.length} items`);
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       message: `Order email sent successfully to ${emailData.vendor_email}`,
-      items_count: items.length,
+      items_count:  items.length,
       order_number: order.order_number
     });
-    
+
   } catch (error) {
     console.error('❌ Error sending order email:', error);
-    
-    // Manejar específicamente error 413 (Payload Too Large)
-    if (error.message?.toLowerCase().includes('payload') || 
+
+    if (error.message?.toLowerCase().includes('payload') ||
         error.message?.toLowerCase().includes('413') ||
         error.message?.toLowerCase().includes('large')) {
-      return res.status(413).json({ 
+      return res.status(413).json({
         success: false,
         message: 'Order has too many items to send via email. Consider splitting the order or using a different method.',
         error: 'Payload too large',
         items_count: req.body.items?.length || 'unknown'
       });
     }
-    
-    res.status(500).json({ 
+
+    res.status(500).json({
       success: false,
-      message: 'Error sending email', 
-      error: error.message 
+      message: 'Error sending email',
+      error: error.message
     });
   }
 };
@@ -422,9 +499,7 @@ const getOrderDates = async (req, res) => {
     }
 
     const [dates] = await pool.execute(query, [storeId]);
-
     const formatted = dates.map(d => ({ ...d, date: toDateString(d.date) }));
-
     res.json({ success: true, data: formatted });
   } catch (error) {
     console.error('Error fetching order dates:', error);
@@ -502,16 +577,16 @@ const getOrdersForView = async (req, res) => {
 };
 
 const deleteOrder = async (req, res) => {
-  try{
-    const {id} = req.params;
+  try {
+    const { id } = req.params;
     const [result] = await pool.execute('DELETE FROM orders WHERE id_orders = ?', [id]);
     if (result.affectedRows === 0) return res.status(404).json({ success: false, message: 'Order not found' });
-    res.json({success: true, message: 'Order deleted successfully'});
-  }catch(error){
+    res.json({ success: true, message: 'Order deleted successfully' });
+  } catch (error) {
     console.error('Error deleting order:', error);
-    res.status(500).json({success: false, message: 'Error deleting order', error: error.message});
+    res.status(500).json({ success: false, message: 'Error deleting order', error: error.message });
   }
-}
+};
 
 module.exports = {
   getInventoriesForOrdering,

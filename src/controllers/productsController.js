@@ -311,7 +311,8 @@ const createProduct = async (req, res) => {
         singlePortionBaseUnit, singlePortionBaseUnitType,
         fullWeight || null, fullWeightUnit || null, 
         fullWeightBaseUnit, fullWeightBaseUnitType,
-        emptyWeight || null, emptyWeightUnit || null, 
+        (emptyWeight !== undefined && emptyWeight !== null && emptyWeight !== '') ? parseFloat(emptyWeight) : null,
+        emptyWeightUnit || null,
         emptyWeightBaseUnit, emptyWeightBaseUnitType,
         caseSize || null, vendorId || null
       ]
@@ -501,7 +502,8 @@ const updateProduct = async (req, res) => {
         singlePortionBaseUnit, singlePortionBaseUnitType,
         fullWeight || null, fullWeightUnit || null, 
         fullWeightBaseUnit, fullWeightBaseUnitType,
-        emptyWeight || null, emptyWeightUnit || null, 
+        (emptyWeight !== undefined && emptyWeight !== null && emptyWeight !== '') ? parseFloat(emptyWeight) : null,
+        emptyWeightUnit || null,
         emptyWeightBaseUnit, emptyWeightBaseUnitType,
         caseSize || null, vendorId || null,
         id
