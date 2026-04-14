@@ -54,9 +54,6 @@ const getAllPhysicalInventories = async (req, res) => {
 
 // ========================================
 // OBTENER UN PHYSICAL INVENTORY POR ID
-// Al editar: trae todos los productos del store con:
-// - inv_quantity: lo que se guardó en este inventario
-// - last_inv_quantity: suma del día más reciente ANTERIOR a este
 // ========================================
 const getPhysicalInventoryById = async (req, res) => {
   try {
@@ -75,8 +72,8 @@ const getPhysicalInventoryById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Inventario físico no encontrado' });
     }
 
-    const inv = inventory[0];
-    const storeId = inv.id_store;
+    const inv       = inventory[0];
+    const storeId   = inv.id_store;
     const inventoryDate = inv.inventory_date;
 
     // 1. Todos los productos del store ordenados por categoría
@@ -98,18 +95,43 @@ const getPhysicalInventoryById = async (req, res) => {
       [storeId]
     );
 
-    // 2. Cantidades guardadas en ESTE inventario
+    // 2. Todos los preps del store
+    const [allPreps] = await pool.execute(
+      `SELECT 
+        pr.id_preps,
+        pr.prep_name as product_name,
+        pr.yield_unit as container_unit,
+        pr.yield_quantity as container_size,
+        'prep' as item_type,
+        'Pre-Batch' as category_name,
+        0 as wholesale_price
+       FROM preps pr
+       WHERE pr.id_store = ?
+       ORDER BY pr.prep_name ASC`,
+      [storeId]
+    );
+
+    // 3. Cantidades guardadas en ESTE inventario — productos
     const [savedItems] = await pool.execute(
       `SELECT ii.id_product, ii.quantity as inv_quantity
        FROM inventory_items ii
-       WHERE ii.id_inventory = ?`,
+       WHERE ii.id_inventory = ? AND ii.item_type = 'product'`,
       [id]
     );
     const savedMap = {};
     savedItems.forEach(item => { savedMap[item.id_product] = item.inv_quantity; });
 
-    // 3. Last Inv = SUMA de todos los inventarios del día más reciente ANTERIOR a este
-    // Agrupa por fecha y suma todas las locations de ese día
+    // 4. Cantidades guardadas en ESTE inventario — preps
+    const [savedPrepItems] = await pool.execute(
+      `SELECT ii.id_prep, ii.quantity as inv_quantity
+       FROM inventory_items ii
+       WHERE ii.id_inventory = ? AND ii.item_type = 'prep'`,
+      [id]
+    );
+    const savedPrepMap = {};
+    savedPrepItems.forEach(item => { savedPrepMap[item.id_prep] = item.inv_quantity; });
+
+    // 5. Last Inv = SUMA del día más reciente ANTERIOR a este inventario (solo productos)
     const [lastInvData] = await pool.execute(
       `SELECT 
         ii.id_product,
@@ -129,8 +151,8 @@ const getPhysicalInventoryById = async (req, res) => {
        INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
        WHERE i.id_store = ?
          AND i.status = 'Locked'
+         AND ii.item_type = 'product'
          AND DATE(i.inventory_date) = (
-           -- Día más reciente anterior a este inventario
            SELECT DATE(i2.inventory_date)
            FROM inventories i2
            WHERE i2.id_store = ?
@@ -147,22 +169,41 @@ const getPhysicalInventoryById = async (req, res) => {
     const lastInvMap = {};
     lastInvData.forEach(item => { lastInvMap[item.id_product] = parseFloat(item.last_quantity) || 0; });
 
-    // 4. Combinar todo
-    const items = allProducts.map((p, i) => ({
-      id_product: p.id_products,
-      product_name: p.product_name,
-      product_code: p.product_code,
-      category_name: p.category_name,
-      wholesale_price: p.wholesale_price || 0,
-      container_size: p.container_size || null,
-      container_unit: p.container_unit || '',
-      container_type: p.container_type || '',
+    // 6. Combinar productos
+    const productItems = allProducts.map((p, i) => ({
+      id_product:        p.id_products,
+      id_preps:          null,
+      item_type:         'product',
+      product_name:      p.product_name,
+      product_code:      p.product_code,
+      category_name:     p.category_name,
+      wholesale_price:   p.wholesale_price || 0,
+      container_size:    p.container_size  || null,
+      container_unit:    p.container_unit  || '',
+      container_type:    p.container_type  || '',
       last_inv_quantity: lastInvMap[p.id_products] ?? 0,
-      inv_quantity: savedMap[p.id_products] ?? null,
-      display_order: i + 1
+      inv_quantity:      savedMap[p.id_products]   ?? null,
+      display_order:     i + 1
     }));
 
-    res.json({ success: true, data: { ...inv, items } });
+    // 7. Combinar preps
+    const prepItems = allPreps.map((p, i) => ({
+      id_product:        null,
+      id_preps:          p.id_preps,
+      item_type:         'prep',
+      product_name:      p.product_name,
+      product_code:      null,
+      category_name:     'Pre-Batch',
+      wholesale_price:   0,
+      container_size:    p.container_size || null,
+      container_unit:    p.container_unit || '',
+      container_type:    'Each',
+      last_inv_quantity: 0,
+      inv_quantity:      savedPrepMap[p.id_preps] ?? null,
+      display_order:     allProducts.length + i + 1
+    }));
+
+    res.json({ success: true, data: { ...inv, items: [...productItems, ...prepItems] } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error al obtener el inventario físico', error: error.message });
   }
@@ -170,7 +211,6 @@ const getPhysicalInventoryById = async (req, res) => {
 
 // ========================================
 // OBTENER PRODUCTOS PARA PHYSICAL INVENTORY (crear nuevo)
-// Last Inv = SUMA de todos los inventarios del día más reciente (todas las locations)
 // ========================================
 const getProductsForPhysicalInventory = async (req, res) => {
   try {
@@ -188,7 +228,8 @@ const getProductsForPhysicalInventory = async (req, res) => {
         p.container_unit,
         p.container_type,
         c.category_name,
-        c.id_categories
+        c.id_categories,
+        'product' as item_type
        FROM products p
        INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
        INNER JOIN categories c ON p.id_category = c.id_categories
@@ -197,10 +238,28 @@ const getProductsForPhysicalInventory = async (req, res) => {
       [storeId]
     );
 
-    if (products.length === 0) return res.json({ success: true, data: [] });
+    // Todos los preps del store
+    const [preps] = await pool.execute(
+      `SELECT 
+        pr.id_preps,
+        pr.prep_name as product_name,
+        pr.yield_unit as container_unit,
+        pr.yield_quantity as container_size,
+        'prep' as item_type,
+        'Pre-Batch' as category_name,
+        NULL as product_code,
+        0 as wholesale_price
+       FROM preps pr
+       WHERE pr.id_store = ?
+       ORDER BY pr.prep_name ASC`,
+      [storeId]
+    );
 
-    // Last Inv = SUMA de todos los inventarios del día más reciente (todas las locations)
-    // Incluye tanto inventarios normales como Physical Inventory
+    if (products.length === 0 && preps.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+
+    // Last Inv = SUMA del día más reciente (solo productos)
     const [lastInvData] = await pool.execute(
       `SELECT 
         ii.id_product,
@@ -220,8 +279,8 @@ const getProductsForPhysicalInventory = async (req, res) => {
        INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
        WHERE i.id_store = ?
          AND i.status = 'Locked'
+         AND ii.item_type = 'product'
          AND DATE(i.inventory_date) = (
-           -- Día más reciente con al menos un inventario Locked
            SELECT DATE(i2.inventory_date)
            FROM inventories i2
            WHERE i2.id_store = ?
@@ -236,12 +295,19 @@ const getProductsForPhysicalInventory = async (req, res) => {
     const lastInvMap = {};
     lastInvData.forEach(item => { lastInvMap[item.id_product] = parseFloat(item.last_quantity) || 0; });
 
-    const result = products.map(p => ({
+    const productResults = products.map(p => ({
       ...p,
+      id_preps:          null,
       last_inv_quantity: lastInvMap[p.id_products] ?? 0
     }));
 
-    res.json({ success: true, data: result });
+    const prepResults = preps.map(p => ({
+      ...p,
+      id_products:       null,
+      last_inv_quantity: 0
+    }));
+
+    res.json({ success: true, data: [...productResults, ...prepResults] });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error retrieving products for physical inventory', error: error.message });
   }
@@ -265,7 +331,7 @@ const createPhysicalInventory = async (req, res) => {
 
     let totalWs = 0;
     items.forEach(item => {
-      const qty = parseFloat(item.inv_quantity) || 0;
+      const qty   = parseFloat(item.inv_quantity)   || 0;
       const price = parseFloat(item.wholesale_price) || 0;
       totalWs += qty * price;
     });
@@ -277,17 +343,26 @@ const createPhysicalInventory = async (req, res) => {
     );
     const inventoryId = result.insertId;
 
-    let displayOrder = 1; 
+    let displayOrder = 1;
     for (const item of items) {
-      const qty = parseFloat(item.inv_quantity) || 0;
+      const qty   = parseFloat(item.inv_quantity)   || 0;
       const price = parseFloat(item.wholesale_price) || 0;
       if (qty > 0) {
-        await connection.execute(
-          `INSERT INTO inventory_items 
-            (id_inventory, id_product, id_location, display_order, quantity_type, quantity, wholesale_value)
-           VALUES (?, ?, ?, ?, 'Each', ?, ?)`,
-          [inventoryId, item.id_products, locationId, displayOrder, qty, qty * price]
-        );
+        if (item.item_type === 'prep') {
+          await connection.execute(
+            `INSERT INTO inventory_items 
+              (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
+             VALUES (?, NULL, ?, 'prep', ?, ?, 'Each', ?, ?)`,
+            [inventoryId, item.id_preps, locationId, displayOrder, qty, qty * price]
+          );
+        } else {
+          await connection.execute(
+            `INSERT INTO inventory_items 
+              (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
+             VALUES (?, ?, NULL, 'product', ?, ?, 'Each', ?, ?)`,
+            [inventoryId, item.id_products, locationId, displayOrder, qty, qty * price]
+          );
+        }
         displayOrder++;
       }
     }
@@ -320,7 +395,7 @@ const updatePhysicalInventory = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { id } = req.params;
+    const { id }                            = req.params;
     const { inventoryDate, status, items = [] } = req.body;
 
     const [inventory] = await connection.execute(
@@ -345,13 +420,13 @@ const updatePhysicalInventory = async (req, res) => {
 
     let totalWs = 0;
     items.forEach(item => {
-      const qty = parseFloat(item.inv_quantity) || 0;
+      const qty   = parseFloat(item.inv_quantity)   || 0;
       const price = parseFloat(item.wholesale_price) || 0;
       totalWs += qty * price;
     });
 
     const updates = [];
-    const params = [];
+    const params  = [];
     if (inventoryDate) { updates.push('inventory_date = ?'); params.push(inventoryDate); }
     if (status)        { updates.push('status = ?');         params.push(status); }
     updates.push('total_ws_value = ?');
@@ -367,15 +442,24 @@ const updatePhysicalInventory = async (req, res) => {
 
     let displayOrder = 1;
     for (const item of items) {
-      const qty = parseFloat(item.inv_quantity) || 0;
+      const qty   = parseFloat(item.inv_quantity)   || 0;
       const price = parseFloat(item.wholesale_price) || 0;
       if (qty > 0) {
-        await connection.execute(
-          `INSERT INTO inventory_items 
-            (id_inventory, id_product, id_location, display_order, quantity_type, quantity, wholesale_value)
-           VALUES (?, ?, ?, ?, 'Each', ?, ?)`,
-          [id, item.id_products, locationId, displayOrder, qty, qty * price]
-        );
+        if (item.item_type === 'prep') {
+          await connection.execute(
+            `INSERT INTO inventory_items 
+              (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
+             VALUES (?, NULL, ?, 'prep', ?, ?, 'Each', ?, ?)`,
+            [id, item.id_preps, locationId, displayOrder, qty, qty * price]
+          );
+        } else {
+          await connection.execute(
+            `INSERT INTO inventory_items 
+              (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
+             VALUES (?, ?, NULL, 'product', ?, ?, 'Each', ?, ?)`,
+            [id, item.id_products, locationId, displayOrder, qty, qty * price]
+          );
+        }
         displayOrder++;
       }
     }

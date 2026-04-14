@@ -22,7 +22,7 @@ const checkActiveInventory = async (locationId, excludeInventoryId = null) => {
 
 const getLastInventoryOrder = async (locationId) => {
   const [result] = await pool.execute(
-    `SELECT ii.id_product, ii.display_order
+    `SELECT ii.id_product, ii.id_prep, ii.item_type, ii.display_order
      FROM inventory_items ii
      INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
      WHERE i.id_location = ?
@@ -60,40 +60,34 @@ const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmp
 };
 
 // ========================================
-// HELPER — calcular product_weight, product_weight_grams, product_weight_unit
+// HELPERS DE CONVERSIÓN
 // ========================================
 const GRAMS = {
   g: 1, kg: 1000, oz: 28.3495, lb: 453.592,
   ml: 1, L: 1000, Liter: 1000, Gallon: 3785.41, 'fl oz': 29.5735
 };
 
-const COUNT_UNITS = ['Bottle', 'Keg', 'Can', 'Each', 'Box', 'Bag', 'Carton'];
+const COUNT_UNITS  = ['Bottle', 'Keg', 'Can', 'Each', 'Box', 'Bag', 'Carton'];
 const VOLUME_UNITS = ['ml', 'L', 'Liter', 'Gallon', 'fl oz'];
 const WEIGHT_UNITS = ['g', 'kg', 'oz', 'lb'];
 
 const calcProductWeight = (quantity, quantityType, fullWeight, emptyWeight, netWeight) => {
   const qty = parseFloat(quantity) || 0;
 
-  // Contables — no tiene producto_weight en gramos, es unit
   if (COUNT_UNITS.includes(quantityType)) {
-    return {
-      product_weight:       qty,
-      product_weight_grams: qty,
-      product_weight_unit:  'unit'
-    };
+    return { product_weight: qty, product_weight_grams: qty, product_weight_unit: 'unit' };
   }
 
   const isWeightOrVolume = WEIGHT_UNITS.includes(quantityType) || VOLUME_UNITS.includes(quantityType);
 
   if (isWeightOrVolume) {
-    const qtyInGrams  = qty * (GRAMS[quantityType] || 1);
-    const baseUnit    = VOLUME_UNITS.includes(quantityType) ? 'ml' : 'g';
-    const emptyVal    = (emptyWeight !== null && emptyWeight !== undefined) ? parseFloat(emptyWeight) : 0;
-    const netVal      = parseFloat(netWeight) || 0;
-    const fullVal     = parseFloat(fullWeight) || 0;
+    const qtyInGrams = qty * (GRAMS[quantityType] || 1);
+    const baseUnit   = VOLUME_UNITS.includes(quantityType) ? 'ml' : 'g';
+    const emptyVal   = (emptyWeight !== null && emptyWeight !== undefined) ? parseFloat(emptyWeight) : 0;
+    const netVal     = parseFloat(netWeight) || 0;
+    const fullVal    = parseFloat(fullWeight) || 0;
 
     if (netVal > 0 && fullVal > 0 && emptyVal > 0) {
-      // Botella pesada — product_weight es el neto actual
       const productWeightGrams = qtyInGrams - emptyVal;
       return {
         product_weight:       parseFloat(productWeightGrams.toFixed(4)),
@@ -101,7 +95,6 @@ const calcProductWeight = (quantity, quantityType, fullWeight, emptyWeight, netW
         product_weight_unit:  baseUnit
       };
     } else {
-      // A granel — la cantidad ya es el producto
       return {
         product_weight:       qty,
         product_weight_grams: parseFloat(qtyInGrams.toFixed(4)),
@@ -110,12 +103,33 @@ const calcProductWeight = (quantity, quantityType, fullWeight, emptyWeight, netW
     }
   }
 
-  // Fallback
-  return {
-    product_weight:       qty,
-    product_weight_grams: qty,
-    product_weight_unit:  'unit'
-  };
+  return { product_weight: qty, product_weight_grams: qty, product_weight_unit: 'unit' };
+};
+
+// ========================================
+// CALCULAR WHOLESALE VALUE DE UN PREP
+// quantity = cantidad capturada, quantityType = unidad capturada
+// yieldQuantity + yieldUnit + totalCost vienen del prep
+// ========================================
+const calcPrepWholesaleValue = (quantity, quantityType, yieldQuantity, yieldUnit, totalCost) => {
+  const qty       = parseFloat(quantity)      || 0;
+  const yieldQty  = parseFloat(yieldQuantity) || 0;
+  const cost      = parseFloat(totalCost)     || 0;
+
+  if (qty <= 0 || yieldQty <= 0 || cost <= 0) return 0;
+
+  // Misma unidad: directo
+  if (quantityType === yieldUnit) {
+    return (cost / yieldQty) * qty;
+  }
+
+  // Convertir ambas a base unit y calcular
+  const qtyBase   = qty      * (GRAMS[quantityType] || 1);
+  const yieldBase = yieldQty * (GRAMS[yieldUnit]    || 1);
+
+  if (yieldBase <= 0) return 0;
+
+  return (cost / yieldBase) * qtyBase;
 };
 
 const validateInventoryItems = (items) => {
@@ -124,7 +138,7 @@ const validateInventoryItems = (items) => {
     if (item.quantity === null || item.quantity === undefined || item.quantity === '') {
       return {
         valid: false,
-        message: `Please enter a quantity for ${item.productName || 'product ' + (i + 1)}`
+        message: `Please enter a quantity for ${item.productName || item.prepName || 'item ' + (i + 1)}`
       };
     }
   }
@@ -200,6 +214,8 @@ const getInventoryById = async (req, res) => {
     if (inventory.length === 0) {
       return res.status(404).json({ success: false, message: 'Inventory not found' });
     }
+
+    // Items — productos
     const [items] = await pool.execute(
       `SELECT 
         ii.*,
@@ -216,10 +232,29 @@ const getInventoryById = async (req, res) => {
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
        LEFT JOIN locations l ON ii.id_location = l.id_locations
-       WHERE ii.id_inventory = ?
+       WHERE ii.id_inventory = ? AND ii.item_type = 'product'
        ORDER BY ii.display_order ASC, p.product_name`,
       [id]
     );
+
+    // Prep items
+    const [prepItems] = await pool.execute(
+      `SELECT 
+        ii.*,
+        pr.prep_name,
+        pr.yield_quantity,
+        pr.yield_unit,
+        pr.yield_unit_cost,
+        pr.total_cost as prep_total_cost,
+        l.location_name
+       FROM inventory_items ii
+       INNER JOIN preps pr ON ii.id_prep = pr.id_preps
+       LEFT JOIN locations l ON ii.id_location = l.id_locations
+       WHERE ii.id_inventory = ? AND ii.item_type = 'prep'
+       ORDER BY ii.display_order ASC, pr.prep_name`,
+      [id]
+    );
+
     const [losses] = await pool.execute(
       `SELECT il.*, p.product_name, p.product_code
        FROM inventory_losses il
@@ -228,7 +263,8 @@ const getInventoryById = async (req, res) => {
        ORDER BY il.created_at DESC`,
       [id]
     );
-    res.json({ success: true, data: { ...inventory[0], items, losses } });
+
+    res.json({ success: true, data: { ...inventory[0], items, prepItems, losses } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error fetching inventory', error: error.message });
   }
@@ -240,6 +276,8 @@ const getAvailableProducts = async (req, res) => {
     if (!storeId) {
       return res.status(400).json({ success: false, message: 'storeId es requerido' });
     }
+
+    // Productos
     const [products] = await pool.execute(
       `SELECT 
         p.id_products as id,
@@ -264,7 +302,23 @@ const getAvailableProducts = async (req, res) => {
        ORDER BY p.product_name`,
       [storeId]
     );
-    res.json({ success: true, data: products });
+
+    // Preps de la tienda
+    const [preps] = await pool.execute(
+      `SELECT 
+        id_preps as id,
+        prep_name as name,
+        total_cost,
+        yield_quantity,
+        yield_unit,
+        yield_unit_cost
+       FROM preps
+       WHERE id_store = ?
+       ORDER BY prep_name`,
+      [storeId]
+    );
+
+    res.json({ success: true, data: products, preps });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error fetching available products', error: error.message });
   }
@@ -275,7 +329,7 @@ const createInventory = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { storeId, locationId, inventoryDate, items, waste = [] } = req.body;
+    const { storeId, locationId, inventoryDate, items, prepItems = [], waste = [] } = req.body;
 
     if (!storeId || !inventoryDate) {
       await connection.rollback();
@@ -283,9 +337,9 @@ const createInventory = async (req, res) => {
     }
 
     const status = req.body.status || 'Open';
-    if (status === 'Locked' && (!items || items.length === 0)) {
+    if (status === 'Locked' && (!items || items.length === 0) && prepItems.length === 0) {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'Please add at least one product before closing the inventory' });
+      return res.status(400).json({ success: false, message: 'Please add at least one product or prep before closing the inventory' });
     }
 
     if (!locationId) {
@@ -297,10 +351,11 @@ const createInventory = async (req, res) => {
       const activeInventoryId = await checkActiveInventory(locationId);
       if (activeInventoryId) {
         await connection.rollback();
-        return res.status(400).json({ success: false, message: 'There is already an active inventory for this location. Please close it before creating a new one.' });
+        return res.status(400).json({ success: false, message: 'There is already an active inventory for this location.' });
       }
     }
 
+    // Ordenar productos
     let finalItems = [];
     if (items && items.length > 0) {
       if (status === 'Locked') {
@@ -311,9 +366,9 @@ const createInventory = async (req, res) => {
         }
       }
 
-      const lastOrder = await getLastInventoryOrder(locationId);
-      const orderMap  = new Map();
-      lastOrder.forEach(item => orderMap.set(item.id_product, item.display_order));
+      const lastOrder  = await getLastInventoryOrder(locationId);
+      const orderMap   = new Map();
+      lastOrder.filter(i => i.item_type === 'product').forEach(item => orderMap.set(item.id_product, item.display_order));
 
       const orderedItems = [];
       const newProducts  = [];
@@ -333,6 +388,20 @@ const createInventory = async (req, res) => {
       ];
     }
 
+    // Ordenar preps
+    let finalPrepItems = [];
+    if (prepItems && prepItems.length > 0) {
+      if (status === 'Locked') {
+        const validation = validateInventoryItems(prepItems);
+        if (!validation.valid) {
+          await connection.rollback();
+          return res.status(400).json({ success: false, message: validation.message });
+        }
+      }
+      const baseOrder = finalItems.length + 1;
+      finalPrepItems = prepItems.map((item, idx) => ({ ...item, order: baseOrder + idx }));
+    }
+
     const [result] = await connection.execute(
       `INSERT INTO inventories (id_store, id_location, inventory_type, inventory_date, status, total_ws_value, total_losses_value)
        VALUES (?, ?, 'Standard', ?, ?, 0, 0)`,
@@ -341,6 +410,8 @@ const createInventory = async (req, res) => {
     const inventoryId = result.insertId;
 
     let totalWsValue = 0;
+
+    // Insertar productos
     for (const item of finalItems) {
       const quantity = parseFloat(item.quantity);
       if (isNaN(quantity)) {
@@ -349,18 +420,16 @@ const createInventory = async (req, res) => {
       }
       const wsValue = parseFloat(item.wholesaleValue) || 0;
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
-
-      // Calcular product_weight, product_weight_grams, product_weight_unit
-      const pw = calcProductWeight(quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
+      const pw      = calcProductWeight(quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
       await connection.execute(
         `INSERT INTO inventory_items (
-          id_inventory, id_product, id_location, display_order,
+          id_inventory, id_product, id_prep, item_type, id_location, display_order,
           quantity_type, quantity, case_size,
           full_weight, empty_weight, net_weight,
           product_weight, product_weight_grams, product_weight_unit,
           wholesale_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, NULL, 'product', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           inventoryId, item.productId, item.locationId || null, item.order,
           item.quantityType, quantity, item.caseSize ? parseInt(item.caseSize) : null,
@@ -372,6 +441,42 @@ const createInventory = async (req, res) => {
       totalWsValue += wsValue;
     }
 
+    // Insertar preps
+    for (const item of finalPrepItems) {
+      const quantity = parseFloat(item.quantity);
+      if (isNaN(quantity)) {
+        await connection.rollback();
+        return res.status(400).json({ success: false, message: `Invalid quantity for prep: ${item.prepName}` });
+      }
+
+      const wsValue = parseFloat(item.wholesaleValue) || 0;
+
+      await connection.execute(
+        `INSERT INTO inventory_items (
+          id_inventory, id_product, id_prep, item_type, id_location, display_order,
+          quantity_type, quantity, case_size,
+          full_weight, empty_weight, net_weight,
+          product_weight, product_weight_grams, product_weight_unit,
+          wholesale_value
+        ) VALUES (?, NULL, ?, 'prep', ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)`,
+        [
+          inventoryId,          // id_inventory
+          item.prepId,          // id_prep
+          item.locationId || null, // id_location
+          item.order,           // display_order
+          item.quantityType,    // quantity_type
+          quantity,             // quantity
+          // case_size, full_weight, empty_weight, net_weight → NULL (ya en el query)
+          quantity,             // product_weight
+          quantity,             // product_weight_grams
+          item.quantityType,    // product_weight_unit
+          wsValue               // wholesale_value
+        ]
+      );
+      totalWsValue += wsValue;
+    }
+
+    // Waste
     let totalWasteValue = 0;
     for (const w of waste) {
       const wsValue = parseFloat(w.wholesaleValue) || 0;
@@ -404,11 +509,10 @@ const updateInventory = async (req, res) => {
     await connection.beginTransaction();
 
     const { id } = req.params;
-    const { locationId, inventoryDate, items, waste = [], status } = req.body;
+    const { locationId, inventoryDate, items, prepItems = [], waste = [], status } = req.body;
 
     const [inventory] = await connection.execute(
-      'SELECT status, id_location FROM inventories WHERE id_inventories = ?',
-      [id]
+      'SELECT status, id_location FROM inventories WHERE id_inventories = ?', [id]
     );
 
     if (inventory.length === 0) {
@@ -429,11 +533,20 @@ const updateInventory = async (req, res) => {
       }
     }
 
-    if (items && items.length > 0 && status === 'Locked') {
-      const validation = validateInventoryItems(items);
-      if (!validation.valid) {
-        await connection.rollback();
-        return res.status(400).json({ success: false, message: validation.message });
+    if (status === 'Locked') {
+      if (items && items.length > 0) {
+        const validation = validateInventoryItems(items);
+        if (!validation.valid) {
+          await connection.rollback();
+          return res.status(400).json({ success: false, message: validation.message });
+        }
+      }
+      if (prepItems && prepItems.length > 0) {
+        const validation = validateInventoryItems(prepItems);
+        if (!validation.valid) {
+          await connection.rollback();
+          return res.status(400).json({ success: false, message: validation.message });
+        }
       }
     }
 
@@ -447,30 +560,53 @@ const updateInventory = async (req, res) => {
       await connection.execute(`UPDATE inventories SET ${updates.join(', ')} WHERE id_inventories = ?`, params);
     }
 
-    if (items && items.length > 0) {
+    if ((items && items.length > 0) || prepItems.length > 0) {
       await connection.execute('DELETE FROM inventory_items WHERE id_inventory = ?', [id]);
 
       let totalWsValue = 0;
-      for (const item of items) {
+
+      // Insertar productos
+      for (const item of (items || [])) {
         const wsValue = parseFloat(item.wholesaleValue) || 0;
         const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
-
-        // Calcular product_weight, product_weight_grams, product_weight_unit
-        const pw = calcProductWeight(parseFloat(item.quantity), item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
-
+        const pw      = calcProductWeight(parseFloat(item.quantity), item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
+      
         await connection.execute(
           `INSERT INTO inventory_items (
-            id_inventory, id_product, id_location, display_order,
+            id_inventory, id_product, id_prep, item_type, id_location, display_order,
             quantity_type, quantity, case_size,
             full_weight, empty_weight, net_weight,
             product_weight, product_weight_grams, product_weight_unit,
             wholesale_value
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, NULL, 'product', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id, item.productId, item.locationId || null, item.displayOrder || item.order || 0,
             item.quantityType, parseFloat(item.quantity), item.caseSize ? parseInt(item.caseSize) : null,
             weights.fullWeight, weights.emptyWeight, weights.netWeight,
             pw.product_weight, pw.product_weight_grams, pw.product_weight_unit,
+            wsValue
+          ]
+        );
+        totalWsValue += wsValue;
+      }
+
+      // Insertar preps
+      for (const item of prepItems) {
+        const quantity = parseFloat(item.quantity);
+        const wsValue  = parseFloat(item.wholesaleValue) || 0;
+
+        await connection.execute(
+          `INSERT INTO inventory_items (
+            id_inventory, id_product, id_prep, item_type, id_location, display_order,
+            quantity_type, quantity, case_size,
+            full_weight, empty_weight, net_weight,
+            product_weight, product_weight_grams, product_weight_unit,
+            wholesale_value
+          ) VALUES (?, NULL, ?, 'prep', ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)`,
+          [
+            id, item.prepId, item.locationId || null, item.displayOrder || item.order || 0,
+            item.quantityType, quantity,
+            quantity, quantity, item.quantityType,
             wsValue
           ]
         );
@@ -525,11 +661,7 @@ const toggleLockInventory = async (req, res) => {
     if (inventory.length === 0) return res.status(404).json({ success: false, message: 'Inventory not found' });
     const newStatus = inventory[0].status === 'Locked' ? 'Unlocked' : 'Locked';
     await pool.execute('UPDATE inventories SET status = ? WHERE id_inventories = ?', [newStatus, id]);
-    res.json({
-      success: true,
-      message: `Inventory ${newStatus === 'Locked' ? 'locked' : 'unlocked'} successfully`,
-      data: { status: newStatus }
-    });
+    res.json({ success: true, message: `Inventory ${newStatus === 'Locked' ? 'locked' : 'unlocked'} successfully`, data: { status: newStatus } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error updating inventory status', error: error.message });
   }
@@ -573,70 +705,68 @@ const getLastInventoryProducts = async (req, res) => {
     );
 
     if (lastInventory.length === 0) {
-      return res.json({ success: true, data: [], message: 'No previous inventories found for this location' });
+      return res.json({ success: true, data: [], prepData: [], message: 'No previous inventories found for this location' });
     }
 
     const lastInventoryId = lastInventory[0].id_inventories;
 
+    // Productos
     const [items] = await pool.execute(
       `SELECT 
-        ii.display_order,
-        ii.quantity_type,
-        ii.full_weight,
-        ii.empty_weight,
-        ii.net_weight,
-        p.id_products as productId,
-        p.product_name as productName,
-        p.product_code as productCode,
-        p.container_type as containerType,
-        p.container_size as containerSize,
-        p.container_unit as containerUnit,
-        p.case_size as caseSize,
-        p.full_weight as product_full_weight,
-        p.empty_weight as product_empty_weight,
+        ii.display_order, ii.quantity_type, ii.full_weight, ii.empty_weight, ii.net_weight,
+        p.id_products as productId, p.product_name as productName, p.product_code as productCode,
+        p.container_type as containerType, p.container_size as containerSize,
+        p.container_unit as containerUnit, p.case_size as caseSize,
+        p.full_weight as product_full_weight, p.empty_weight as product_empty_weight,
         p.wholesale_price as wholesalePrice
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
-       WHERE ii.id_inventory = ?
+       WHERE ii.id_inventory = ? AND ii.item_type = 'product'
        ORDER BY ii.display_order ASC`,
       [lastInventoryId]
     );
 
-    res.json({ success: true, data: items, lastInventoryId });
+    // Preps
+    const [prepData] = await pool.execute(
+      `SELECT 
+        ii.display_order, ii.quantity_type,
+        pr.id_preps as prepId, pr.prep_name as prepName,
+        pr.yield_quantity as yieldQuantity, pr.yield_unit as yieldUnit,
+        pr.yield_unit_cost as yieldUnitCost, pr.total_cost as totalCost
+       FROM inventory_items ii
+       INNER JOIN preps pr ON ii.id_prep = pr.id_preps
+       WHERE ii.id_inventory = ? AND ii.item_type = 'prep'
+       ORDER BY ii.display_order ASC`,
+      [lastInventoryId]
+    );
+
+    res.json({ success: true, data: items, prepData, lastInventoryId });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error fetching last inventory products', error: error.message });
   }
 };
 
 // ========================================
-// IMPORTAR INVENTARIO DESDE EXCEL
+// IMPORTAR INVENTARIO DESDE EXCEL (sin cambios)
 // ========================================
 const importInventoryFromExcel = async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
 
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
 
     const { storeId, inventoryDate } = req.body;
-    if (!storeId) {
-      return res.status(400).json({ success: false, message: 'storeId is required' });
-    }
+    if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
 
     const locationId = await getOrCreateFromExcelLocation(storeId);
+    const workbook   = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const worksheet  = workbook.Sheets[workbook.SheetNames[0]];
+    const data       = XLSX.utils.sheet_to_json(worksheet, { defval: null });
+    const date       = inventoryDate || new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-    const workbook  = XLSX.read(req.file.buffer, { type: 'buffer' });
-    const worksheet = workbook.Sheets[workbook.SheetNames[0]];
-    const data      = XLSX.utils.sheet_to_json(worksheet, { defval: null });
-
-    const date = inventoryDate || new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-    let imported = 0;
-    let skipped  = 0;
-    const errors = [];
-    const items  = [];
+    let imported = 0, skipped = 0;
+    const errors = [], items = [];
 
     for (let i = 0; i < data.length; i++) {
       const row    = data[i];
@@ -649,7 +779,7 @@ const importInventoryFromExcel = async (req, res) => {
       if (!productCode && !productName) { skipped++; continue; }
 
       const quantity = parseFloat(row['Closing Inv']) || 0;
-      if (quantity === null || quantity === undefined || isNaN(quantity)) { skipped++; continue; }
+      if (isNaN(quantity)) { skipped++; continue; }
 
       try {
         let productRow = null;
@@ -686,10 +816,10 @@ const importInventoryFromExcel = async (req, res) => {
           continue;
         }
 
-        const weightType = containerTypeExcel || productRow.container_type || 'Bottle';
-
+        const weightType     = containerTypeExcel || productRow.container_type || 'Bottle';
         const containerTypes = ['Bottle', 'Keg', 'Can', 'Each', 'Box', 'Bag', 'Carton'];
-        let wholesaleValue = 0;
+        let wholesaleValue   = 0;
+
         if (productRow.wholesale_price) {
           const price     = parseFloat(productRow.wholesale_price);
           const caseSize  = parseFloat(productRow.case_size) || 1;
@@ -709,20 +839,13 @@ const importInventoryFromExcel = async (req, res) => {
         }
 
         items.push({
-          productId:    productRow.id_products,
-          productName:  productRow.product_name,
-          quantityType: weightType,
-          quantity,
-          wholesaleValue,
-          fullWeight:   productRow.full_weight  || null,
-          emptyWeight:  productRow.empty_weight ?? null,
-          caseSize:     productRow.case_size    || null,
-          displayOrder: imported + 1
+          productId: productRow.id_products, productName: productRow.product_name,
+          quantityType: weightType, quantity, wholesaleValue,
+          fullWeight: productRow.full_weight || null, emptyWeight: productRow.empty_weight ?? null,
+          caseSize: productRow.case_size || null, displayOrder: imported + 1
         });
-
         imported++;
       } catch (rowError) {
-        console.error(`Error processing row ${rowNum}:`, rowError);
         errors.push(`Row ${rowNum}: ${rowError.message}`);
         skipped++;
       }
@@ -730,11 +853,7 @@ const importInventoryFromExcel = async (req, res) => {
 
     if (items.length === 0) {
       await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'No valid products found in the file',
-        stats: { total: data.length, imported: 0, skipped, errors }
-      });
+      return res.status(400).json({ success: false, message: 'No valid products found in the file', stats: { total: data.length, imported: 0, skipped, errors } });
     }
 
     const [invResult] = await connection.execute(
@@ -747,44 +866,34 @@ const importInventoryFromExcel = async (req, res) => {
     let totalWsValue = 0;
     for (const item of items) {
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
-      const pw = calcProductWeight(item.quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
+      const pw      = calcProductWeight(item.quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
       await connection.execute(
         `INSERT INTO inventory_items (
-          id_inventory, id_product, id_location, display_order,
-          quantity_type, quantity, case_size,
-          full_weight, empty_weight, net_weight,
-          product_weight, product_weight_grams, product_weight_unit,
-          wholesale_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id_inventory, id_product, id_prep, item_type, id_location, display_order,
+          quantity_type, quantity, case_size, full_weight, empty_weight, net_weight,
+          product_weight, product_weight_grams, product_weight_unit, wholesale_value
+        ) VALUES (?, ?, NULL, 'product', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           inventoryId, item.productId, locationId, item.displayOrder,
           item.quantityType, item.quantity, item.caseSize ? parseInt(item.caseSize) : null,
           weights.fullWeight, weights.emptyWeight, weights.netWeight,
-          pw.product_weight, pw.product_weight_grams, pw.product_weight_unit,
-          item.wholesaleValue
+          pw.product_weight, pw.product_weight_grams, pw.product_weight_unit, item.wholesaleValue
         ]
       );
       totalWsValue += item.wholesaleValue;
     }
 
-    await connection.execute(
-      `UPDATE inventories SET total_ws_value = ? WHERE id_inventories = ?`,
-      [totalWsValue, inventoryId]
-    );
-
+    await connection.execute(`UPDATE inventories SET total_ws_value = ? WHERE id_inventories = ?`, [totalWsValue, inventoryId]);
     await connection.commit();
 
     res.status(201).json({
-      success: true,
-      message: 'Import completed',
+      success: true, message: 'Import completed',
       data: { inventoryId, locationId, locationName: 'From Excel' },
       stats: { total: data.length, imported, skipped, errors: errors.length > 0 ? errors : undefined }
     });
-
   } catch (error) {
     await connection.rollback();
-    console.error('Import inventory error:', error);
     res.status(500).json({ success: false, message: 'Error importing inventory', error: error.message });
   } finally {
     connection.release();
@@ -792,7 +901,7 @@ const importInventoryFromExcel = async (req, res) => {
 };
 
 // ========================================
-// GET PRODUCTS FOR PRINT INVENTORY BY LOCATION
+// GET PRODUCTS FOR PRINT — incluye preps
 // ========================================
 const getProductsForPrintInventory = async (req, res) => {
   try {
@@ -812,34 +921,29 @@ const getProductsForPrintInventory = async (req, res) => {
       return res.json({ success: true, data: [], message: 'No locked inventory found for this location' });
     }
 
-    const [items] = await pool.execute(
+    // Productos
+    const [productItems] = await pool.execute(
       `SELECT 
         p.id_products,
-        p.product_name,
+        p.product_name as name,
         p.product_code,
         p.container_size,
         p.container_unit,
         p.container_type,
         c.category_name,
+        'product' as item_type,
         ROUND(SUM(
           CASE
             WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
             WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb', 'ml', 'L', 'Liter', 'Gallon', 'fl oz') THEN
               CASE
                 WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight IS NOT NULL AND ii.empty_weight > 0 THEN
-                  (
-                    CASE ii.quantity_type
-                      WHEN 'kg'     THEN ii.quantity * 1000
-                      WHEN 'oz'     THEN ii.quantity * 28.3495
-                      WHEN 'lb'     THEN ii.quantity * 453.592
-                      WHEN 'L'      THEN ii.quantity * 1000
-                      WHEN 'Liter'  THEN ii.quantity * 1000
-                      WHEN 'Gallon' THEN ii.quantity * 3785.41
-                      WHEN 'fl oz'  THEN ii.quantity * 29.5735
-                      ELSE ii.quantity
-                    END
-                    - ii.empty_weight
-                  ) / ii.net_weight
+                  (CASE ii.quantity_type
+                    WHEN 'kg' THEN ii.quantity * 1000 WHEN 'oz' THEN ii.quantity * 28.3495
+                    WHEN 'lb' THEN ii.quantity * 453.592 WHEN 'L' THEN ii.quantity * 1000
+                    WHEN 'Liter' THEN ii.quantity * 1000 WHEN 'Gallon' THEN ii.quantity * 3785.41
+                    WHEN 'fl oz' THEN ii.quantity * 29.5735 ELSE ii.quantity END
+                    - ii.empty_weight) / ii.net_weight
                 ELSE ii.product_weight_grams / NULLIF(p.container_size_base_unit, 0)
               END
             ELSE ii.quantity
@@ -848,14 +952,34 @@ const getProductsForPrintInventory = async (req, res) => {
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
        INNER JOIN categories c ON p.id_category = c.id_categories
-       WHERE ii.id_inventory = ?
+       WHERE ii.id_inventory = ? AND ii.item_type = 'product'
        GROUP BY p.id_products
        ORDER BY c.category_name ASC, p.product_name ASC`,
       [lastInventory[0].id_inventories]
     );
 
-    res.json({ success: true, data: items });
+    // Preps
+    const [prepItems] = await pool.execute(
+      `SELECT
+        pr.id_preps,
+        pr.prep_name as name,
+        pr.yield_unit as container_unit,
+        'prep' as item_type,
+        'Pre-Batch' as category_name,
+        pr.yield_unit as quantity_type,
+        SUM(ii.quantity) as last_inv_quantity
+       FROM inventory_items ii
+       INNER JOIN preps pr ON ii.id_prep = pr.id_preps
+       WHERE ii.id_inventory = ? AND ii.item_type = 'prep'
+       GROUP BY pr.id_preps, pr.prep_name, pr.yield_unit
+       ORDER BY pr.prep_name ASC`,
+      [lastInventory[0].id_inventories]
+    );
+
+    res.json({ success: true, data: [...productItems, ...prepItems] });
   } catch (error) {
+    console.error('❌ print error:', error.message);
+    console.error('SQL:', error.sql);
     res.status(500).json({ success: false, message: 'Error fetching products for print', error: error.message });
   }
 };
