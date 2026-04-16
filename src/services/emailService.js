@@ -14,7 +14,14 @@ const transporter = nodemailer.createTransport({
 // Verificar configuración
 transporter.verify((error, success) => {
   if (error) {
-    console.error('❌ Email configuration error:', error);
+    console.error('❌ Email configuration error:', error.message);
+    console.error('Config being used:', {
+      host:   process.env.EMAIL_HOST     || 'NOT SET',
+      port:   process.env.EMAIL_PORT     || 'NOT SET',
+      secure: process.env.EMAIL_SECURE   || 'NOT SET',
+      user:   process.env.EMAIL_USER     || 'NOT SET',
+      pass:   process.env.EMAIL_PASSWORD ? 'SET' : 'NOT SET',
+    });
   } else {
     console.log('✅ Email server ready to send messages');
   }
@@ -166,10 +173,10 @@ const sendOrderEmail = async (orderData) => {
 
   try {
     const info = await transporter.sendMail(mailOptions);
-    console.log(`✅ Email sent successfully: ${info.messageId}`);
+    console.log(`Email sent successfully: ${info.messageId}`);
     return { success: true, messageId: info.messageId };
   } catch (error) {
-    console.error('❌ Email send error:', error.message);
+    console.error('Email send error:', error.message);
     throw error;
   }
 };

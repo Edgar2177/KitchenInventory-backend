@@ -72,11 +72,11 @@ const getPhysicalInventoryById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Inventario físico no encontrado' });
     }
 
-    const inv       = inventory[0];
-    const storeId   = inv.id_store;
+    const inv           = inventory[0];
+    const storeId       = inv.id_store;
     const inventoryDate = inv.inventory_date;
 
-    // 1. Todos los productos del store ordenados por categoría
+    // 1. Todos los productos del store ordenados por product type → categoría
     const [allProducts] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -86,12 +86,14 @@ const getPhysicalInventoryById = async (req, res) => {
         p.container_unit,
         p.container_type,
         p.wholesale_price,
-        c.category_name
+        c.category_name,
+        pt.product_name AS product_type_name
        FROM products p
        INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
        INNER JOIN categories c ON p.id_category = c.id_categories
+       INNER JOIN product_types pt ON p.id_product_type = pt.id_product_types
        WHERE pbs.id_store = ?
-       ORDER BY c.category_name ASC, p.product_name ASC`,
+       ORDER BY pt.product_name ASC, c.category_name ASC, p.product_name ASC`,
       [storeId]
     );
 
@@ -104,6 +106,7 @@ const getPhysicalInventoryById = async (req, res) => {
         pr.yield_quantity as container_size,
         'prep' as item_type,
         'Pre-Batch' as category_name,
+        'Pre-Batch' as product_type_name,
         0 as wholesale_price
        FROM preps pr
        WHERE pr.id_store = ?
@@ -177,6 +180,7 @@ const getPhysicalInventoryById = async (req, res) => {
       product_name:      p.product_name,
       product_code:      p.product_code,
       category_name:     p.category_name,
+      product_type_name: p.product_type_name || 'Other',
       wholesale_price:   p.wholesale_price || 0,
       container_size:    p.container_size  || null,
       container_unit:    p.container_unit  || '',
@@ -194,6 +198,7 @@ const getPhysicalInventoryById = async (req, res) => {
       product_name:      p.product_name,
       product_code:      null,
       category_name:     'Pre-Batch',
+      product_type_name: 'Pre-Batch',
       wholesale_price:   0,
       container_size:    p.container_size || null,
       container_unit:    p.container_unit || '',
@@ -217,7 +222,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
     const { storeId } = req.query;
     if (!storeId) return res.status(400).json({ success: false, message: 'storeId es requerido' });
 
-    // Todos los productos del store ordenados por categoría
+    // Todos los productos del store ordenados por product type → categoría
     const [products] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -229,12 +234,14 @@ const getProductsForPhysicalInventory = async (req, res) => {
         p.container_type,
         c.category_name,
         c.id_categories,
+        pt.product_name AS product_type_name,
         'product' as item_type
        FROM products p
        INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
        INNER JOIN categories c ON p.id_category = c.id_categories
+       INNER JOIN product_types pt ON p.id_product_type = pt.id_product_types
        WHERE pbs.id_store = ?
-       ORDER BY c.category_name ASC, p.product_name ASC`,
+       ORDER BY pt.product_name ASC, c.category_name ASC, p.product_name ASC`,
       [storeId]
     );
 
@@ -247,6 +254,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
         pr.yield_quantity as container_size,
         'prep' as item_type,
         'Pre-Batch' as category_name,
+        'Pre-Batch' as product_type_name,
         NULL as product_code,
         0 as wholesale_price
        FROM preps pr
@@ -298,12 +306,14 @@ const getProductsForPhysicalInventory = async (req, res) => {
     const productResults = products.map(p => ({
       ...p,
       id_preps:          null,
+      product_type_name: p.product_type_name || 'Other',
       last_inv_quantity: lastInvMap[p.id_products] ?? 0
     }));
 
     const prepResults = preps.map(p => ({
       ...p,
       id_products:       null,
+      product_type_name: 'Pre-Batch',
       last_inv_quantity: 0
     }));
 
@@ -395,7 +405,7 @@ const updatePhysicalInventory = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { id }                            = req.params;
+    const { id }                                = req.params;
     const { inventoryDate, status, items = [] } = req.body;
 
     const [inventory] = await connection.execute(

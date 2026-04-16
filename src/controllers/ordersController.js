@@ -430,6 +430,8 @@ const sendOrderEmail = async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error sending order email:', error);
+    console.error('❌ sendOrderEmail error:', error.message);
+    console.error('❌ Stack:', error.stack);
 
     if (error.message?.toLowerCase().includes('payload') ||
         error.message?.toLowerCase().includes('413') ||
