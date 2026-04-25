@@ -6,11 +6,13 @@ const { testConnection } = require('./src/config/database');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configuración SIMPLE pero efectiva de CORS
+// Configuración de CORS
 const corsOptions = {
   origin: [
-    'https://invkitchen.callhospitality.ca',,
-    'http://localhost:3000'
+    'https://inventory.callhospitality.ca',
+    'https://www.inventory.callhospitality.ca',
+    'http://localhost:3000',
+    'http://localhost:3010'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -43,12 +45,6 @@ app.use('/api/products', productsRoutes);
 const productsByStoreRoutes = require('./src/routes/productsByStore');
 app.use('/api/products-by-store', productsByStoreRoutes);
 
-const ordersRoutes = require('./src/routes/orders');
-app.use('/api/orders', ordersRoutes);
-
-const physicalInventoryRoutes = require('./src/routes/physicalinventory');
-app.use('/api/physical-inventories', physicalInventoryRoutes);
-
 // Rutas de autenticación y usuarios
 const authRoutes = require('./src/routes/auth');
 app.use('/api/auth', authRoutes);
@@ -70,6 +66,18 @@ app.use('/api/inventories', inventoriesRoutes);
 
 const prepsRoutes = require('./src/routes/preps');
 app.use('/api/preps', prepsRoutes);
+
+const ordersRoutes = require('./src/routes/orders');
+app.use('/api/orders', ordersRoutes);
+
+const physicalInventoryRoutes = require('./src/routes/physicalinventory');
+app.use('/api/physical-inventories', physicalInventoryRoutes);
+
+const notificationsRoutes = require('./src/routes/notifications');
+app.use('/api/notifications', notificationsRoutes);
+
+const invoicesRoutes = require('./src/routes/invoices');
+app.use('/api/invoices', invoicesRoutes);
 
 // Manejo de rutas no encontradas
 app.use((req, res) => {
