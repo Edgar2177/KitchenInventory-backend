@@ -9,10 +9,7 @@ const PORT = process.env.PORT || 5000;
 // Configuración de CORS
 const corsOptions = {
   origin: [
-    'https://inventory.callhospitality.ca',
-    'https://www.inventory.callhospitality.ca',
-    'http://localhost:3000',
-    'http://localhost:3010'
+    'https://invkitchen.callhospitality.ca' 
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
