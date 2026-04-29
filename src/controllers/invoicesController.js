@@ -624,18 +624,17 @@ const getVendorsForStore = async (req, res) => {
     const { storeId } = req.query;
     if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
 
+    // Traer todos los vendors — no solo los que tienen órdenes en esta tienda,
+    // para que no-order invoices pueda usarse con cualquier proveedor
     const [vendors] = await pool.execute(
-      `SELECT DISTINCT
+      `SELECT
          v.id_vendors,
          v.vendor_name,
          v.contact_name,
          v.email,
          v.phone
        FROM vendors v
-       INNER JOIN orders o ON o.id_vendor = v.id_vendors
-       WHERE o.id_store = ?
-       ORDER BY v.vendor_name ASC`,
-      [storeId]
+       ORDER BY v.vendor_name ASC`
     );
 
     res.json({ success: true, data: vendors });
