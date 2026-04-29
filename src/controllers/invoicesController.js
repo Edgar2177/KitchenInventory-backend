@@ -113,7 +113,6 @@ const getInvoiceByOrder = async (req, res) => {
   try {
     const { orderId, storeId, invoiceId } = req.query;
 
-    // Modo no-order: buscar por invoiceId directamente
     if (invoiceId) {
       const [existing] = await pool.execute(
         `SELECT * FROM invoices WHERE id_invoice = ? AND id_store = ? LIMIT 1`,
@@ -197,7 +196,7 @@ const getInvoiceByOrder = async (req, res) => {
 };
 
 // ============================================================
-// SAVE INVOICE — soporta modo normal Y no-order + email en ambos
+// SAVE INVOICE
 // ============================================================
 const saveInvoice = async (req, res) => {
   const connection = await pool.getConnection();
@@ -214,26 +213,23 @@ const saveInvoice = async (req, res) => {
       createdBy,
       receiptUrl,
       receiptPublicId,
+      invoiceDate,        // ← fecha editable (solo no-order)
       noOrder = false
     } = req.body;
 
-    // ── Validación ──────────────────────────────────────────
     if (!storeId) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'storeId is required' });
     }
-
     if (!noOrder && !orderId) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'orderId is required for normal invoices' });
     }
-
     if (noOrder && !vendorId) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'vendorId is required for no-order invoices' });
     }
 
-    // ── Calcular total ───────────────────────────────────────
     let totalAmount = 0;
     items.forEach(item => {
       const qty   = parseFloat(item.received_qty)  || 0;
@@ -241,30 +237,65 @@ const saveInvoice = async (req, res) => {
       totalAmount += qty * price;
     });
 
-    // ── Insertar o actualizar invoice ────────────────────────
     let invoiceId;
 
     if (noOrder) {
-      // NO-ORDER: siempre crear uno nuevo
-      const [result] = await connection.execute(
-        `INSERT INTO invoices
-           (id_order, id_store, id_vendor, invoice_number, status, total_amount, notes, created_by, receipt_url, receipt_public_id, no_order)
-         VALUES (NULL, ?, ?, ?, 'Saved', ?, ?, ?, ?, ?, 1)`,
-        [
-          storeId,
-          vendorId,
-          invoiceNumber   || null,
-          totalAmount,
-          notes           || null,
-          createdBy       || null,
-          receiptUrl      || null,
-          receiptPublicId || null
-        ]
-      );
-      invoiceId = result.insertId;
+      // Si ya existe el invoice (edición), hacer UPDATE; si no, INSERT
+      const existingInvoiceId = req.body.invoiceId ? parseInt(req.body.invoiceId) : null;
+
+      if (existingInvoiceId) {
+        // ── EDITAR invoice no-order existente ──────────────────
+        invoiceId = existingInvoiceId;
+        await connection.execute(
+          `UPDATE invoices
+             SET id_vendor         = ?,
+                 invoice_number    = ?,
+                 status            = 'Saved',
+                 total_amount      = ?,
+                 notes             = ?,
+                 receipt_url       = COALESCE(?, receipt_url),
+                 receipt_public_id = COALESCE(?, receipt_public_id),
+                 invoice_date      = COALESCE(?, invoice_date),
+                 updated_at        = NOW()
+           WHERE id_invoice = ? AND id_store = ?`,
+          [
+            vendorId,
+            invoiceNumber   || null,
+            totalAmount,
+            notes           || null,
+            receiptUrl      || null,
+            receiptPublicId || null,
+            invoiceDate     || null,
+            existingInvoiceId,
+            storeId
+          ]
+        );
+        // Borrar items anteriores para reinsertarlos actualizados
+        await connection.execute('DELETE FROM invoice_items WHERE id_invoice = ?', [invoiceId]);
+
+      } else {
+        // ── CREAR nuevo invoice no-order ───────────────────────
+        const [result] = await connection.execute(
+          `INSERT INTO invoices
+             (id_order, id_store, id_vendor, invoice_number, status, total_amount,
+              notes, created_by, receipt_url, receipt_public_id, no_order, invoice_date)
+           VALUES (NULL, ?, ?, ?, 'Saved', ?, ?, ?, ?, ?, 1, ?)`,
+          [
+            storeId,
+            vendorId,
+            invoiceNumber   || null,
+            totalAmount,
+            notes           || null,
+            createdBy       || null,
+            receiptUrl      || null,
+            receiptPublicId || null,
+            invoiceDate     || null,
+          ]
+        );
+        invoiceId = result.insertId;
+      }
 
     } else {
-      // NORMAL: buscar si ya existe invoice para esa orden
       const [existing] = await connection.execute(
         'SELECT id_invoice FROM invoices WHERE id_order = ? AND id_store = ?',
         [orderId, storeId]
@@ -296,7 +327,6 @@ const saveInvoice = async (req, res) => {
       }
     }
 
-    // ── Insertar items ───────────────────────────────────────
     const priceDiscrepancies    = [];
     const quantityDiscrepancies = [];
 
@@ -326,7 +356,6 @@ const saveInvoice = async (req, res) => {
         ]
       );
 
-      // Actualizar precio si cambió
       if (item.id_product && priceInvoice !== null && Math.abs(priceInvoice - priceApp) > 0.001) {
         await connection.execute(
           'UPDATE products SET wholesale_price = ?, updated_at = NOW() WHERE id_products = ?',
@@ -340,7 +369,6 @@ const saveInvoice = async (req, res) => {
         });
       }
 
-      // Discrepancias de cantidad solo aplican en modo normal
       if (!noOrder && !item.is_extra && receivedQty !== null && Math.abs(receivedQty - orderedQty) > 0.001) {
         quantityDiscrepancies.push({
           product_name: item.product_name,
@@ -352,7 +380,6 @@ const saveInvoice = async (req, res) => {
       }
     }
 
-    // ── Marcar orden como Received (solo modo normal) ────────
     if (!noOrder && orderId) {
       await connection.execute(
         `UPDATE orders SET status = 'Received', received_at = NOW() WHERE id_orders = ?`,
@@ -362,36 +389,21 @@ const saveInvoice = async (req, res) => {
 
     await connection.commit();
 
-    // ── EMAIL ────────────────────────────────────────────────
-    // Modo normal  → manda solo si hay discrepancias de cantidad
-    // Modo no-order → siempre manda
     const shouldSendEmail = noOrder || quantityDiscrepancies.length > 0;
     let notificationSent  = false;
 
     if (shouldSendEmail) {
       try {
-        const notifType      = noOrder ? 'no_order_invoice' : 'invoice_discrepancy';
-        let recipients       = await getRecipientsForType(storeId, notifType);
-
-        // Fallback: si no hay recipients configurados para no_order_invoice
-        // usar los mismos de invoice_discrepancy
+        const notifType  = noOrder ? 'no_order_invoice' : 'invoice_discrepancy';
+        let recipients   = await getRecipientsForType(storeId, notifType);
         if (recipients.length === 0 && noOrder) {
           recipients = await getRecipientsForType(storeId, 'invoice_discrepancy');
         }
 
         if (recipients.length > 0) {
-
           if (noOrder) {
-            // ── Email No Order ───────────────────────────────
-            const [[vendor]] = await pool.execute(
-              'SELECT vendor_name FROM vendors WHERE id_vendors = ?',
-              [vendorId]
-            );
-            const [[store]] = await pool.execute(
-              'SELECT store_name FROM stores WHERE id_stores = ?',
-              [storeId]
-            );
-
+            const [[vendor]] = await pool.execute('SELECT vendor_name FROM vendors WHERE id_vendors = ?', [vendorId]);
+            const [[store]]  = await pool.execute('SELECT store_name FROM stores WHERE id_stores = ?',   [storeId]);
             await sendInvoiceDiscrepancyEmail({
               recipients,
               order_number:        null,
@@ -410,9 +422,7 @@ const saveInvoice = async (req, res) => {
                 price_invoice: i.price_invoice != null && i.price_invoice !== '' ? parseFloat(i.price_invoice) : parseFloat(i.price_app) || 0,
               }))
             });
-
           } else {
-            // ── Email Discrepancias Orden Normal ─────────────
             const [[order]] = await pool.execute(
               `SELECT o.order_number, o.sent_at, v.vendor_name, s.store_name
                  FROM orders o
@@ -421,7 +431,6 @@ const saveInvoice = async (req, res) => {
                 WHERE o.id_orders = ?`,
               [orderId]
             );
-
             await sendInvoiceDiscrepancyEmail({
               recipients,
               order_number:        order?.order_number || `#${orderId}`,
@@ -435,7 +444,6 @@ const saveInvoice = async (req, res) => {
               no_order:            false
             });
           }
-
           notificationSent = true;
         }
       } catch (emailErr) {
@@ -465,7 +473,7 @@ const saveInvoice = async (req, res) => {
 };
 
 // ============================================================
-// GET ALL INVOICES FOR A STORE — LEFT JOIN para incluir no-order
+// GET ALL INVOICES — ── FIX: usa invoice_date para no-order ──
 // ============================================================
 const getAllInvoices = async (req, res) => {
   try {
@@ -475,6 +483,7 @@ const getAllInvoices = async (req, res) => {
     const [invoices] = await pool.execute(
       `SELECT 
         i.id_invoice,
+        i.id_vendor,
         i.invoice_number,
         i.status,
         i.total_amount,
@@ -486,7 +495,8 @@ const getAllInvoices = async (req, res) => {
         o.order_number,
         o.sent_at,
         COALESCE(v_order.vendor_name, v_direct.vendor_name) AS vendor_name,
-        COUNT(ii.id_invoice_item) as total_items
+        COUNT(ii.id_invoice_item) as total_items,
+        COALESCE(i.invoice_date, o.sent_at, i.created_at) AS display_date
        FROM invoices i
        LEFT JOIN orders        o         ON i.id_order  = o.id_orders
        LEFT JOIN vendors       v_order   ON o.id_vendor = v_order.id_vendors
@@ -544,13 +554,10 @@ const uploadReceipt = async (req, res) => {
     if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
 
     const { uploadReceiptImage } = require('../services/cloudinaryService');
-
     const timestamp = Date.now();
     const filename  = `receipt_store${storeId}_order${orderId || 'noorder'}_${timestamp}`;
+    const result    = await uploadReceiptImage(req.file.buffer, filename);
 
-    const result = await uploadReceiptImage(req.file.buffer, filename);
-
-    // Si ya existe el invoice, guardar la URL directamente
     if (invoiceId) {
       await pool.execute(
         'UPDATE invoices SET receipt_url = ?, receipt_public_id = ? WHERE id_invoice = ?',
@@ -558,14 +565,7 @@ const uploadReceipt = async (req, res) => {
       );
     }
 
-    res.json({
-      success: true,
-      message: 'Receipt uploaded successfully',
-      data: {
-        url:       result.secure_url,
-        public_id: result.public_id
-      }
-    });
+    res.json({ success: true, message: 'Receipt uploaded successfully', data: { url: result.secure_url, public_id: result.public_id } });
   } catch (error) {
     console.error('Error uploading receipt:', error);
     res.status(500).json({ success: false, message: 'Error uploading receipt', error: error.message });
@@ -584,7 +584,6 @@ const deleteInvoice = async (req, res) => {
     if (!invoiceId || !storeId)
       return res.status(400).json({ success: false, message: 'invoiceId and storeId are required' });
 
-    // Verificar que pertenece al store
     const [existing] = await connection.execute(
       'SELECT id_invoice, id_order, no_order FROM invoices WHERE id_invoice = ? AND id_store = ?',
       [invoiceId, storeId]
@@ -596,14 +595,9 @@ const deleteInvoice = async (req, res) => {
     }
 
     const invoice = existing[0];
-
-    // Borrar items primero
     await connection.execute('DELETE FROM invoice_items WHERE id_invoice = ?', [invoiceId]);
-
-    // Borrar invoice
     await connection.execute('DELETE FROM invoices WHERE id_invoice = ?', [invoiceId]);
 
-    // Si era orden normal, regresar la orden a status 'Sent'
     if (!invoice.no_order && invoice.id_order) {
       await connection.execute(
         `UPDATE orders SET status = 'Sent', received_at = NULL WHERE id_orders = ?`,
@@ -612,7 +606,6 @@ const deleteInvoice = async (req, res) => {
     }
 
     await connection.commit();
-
     res.json({ success: true, message: 'Invoice deleted successfully' });
   } catch (error) {
     await connection.rollback();
@@ -624,25 +617,27 @@ const deleteInvoice = async (req, res) => {
 };
 
 // ============================================================
-// GET VENDORS FOR STORE (para el modal No-Order)
+// GET VENDORS FOR STORE
 // ============================================================
 const getVendorsForStore = async (req, res) => {
   try {
     const { storeId } = req.query;
-    if (!storeId)
-      return res.status(400).json({ success: false, message: 'storeId is required' });
- 
+    if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
+
     const [vendors] = await pool.execute(
-      `SELECT 
+      `SELECT DISTINCT
          v.id_vendors,
          v.vendor_name,
          v.contact_name,
          v.email,
          v.phone
        FROM vendors v
+       INNER JOIN orders o ON o.id_vendor = v.id_vendors
+       WHERE o.id_store = ?
        ORDER BY v.vendor_name ASC`,
+      [storeId]
     );
- 
+
     res.json({ success: true, data: vendors });
   } catch (error) {
     console.error('Error fetching vendors for store:', error);
