@@ -38,8 +38,6 @@ const getInventoriesForOrdering = async (req, res) => {
 // ============================================
 // HELPERS DE CONVERSIÓN
 // ============================================
-
-// Convierte una cantidad en su unidad original a gramos/ml (base unit)
 const toBaseGrams = (quantity, unit) => {
   switch (unit) {
     case 'kg':     return quantity * 1000;
@@ -55,11 +53,6 @@ const toBaseGrams = (quantity, unit) => {
   }
 };
 
-// Calcula el stock en unidades de contenedor a partir de los rows de inventory_items
-// Lógica:
-//   - Contables (Bottle, Keg, etc.)    → quantity directamente
-//   - Pesados con full/empty > 0       → porcentaje de llenado (fórmula botella)
-//   - A granel (kg, lb, oz, g, ml, L)  → convierte a base unit y divide entre container_size_base_unit
 const calcStockUnits = (rows, containerSizeBaseUnit) => {
   let total = 0;
 
@@ -72,22 +65,16 @@ const calcStockUnits = (rows, containerSizeBaseUnit) => {
     const countUnits = ['Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton'];
 
     if (countUnits.includes(qtype)) {
-      // Contable directo
       total += qty;
-
     } else {
-      // Unidad de peso o volumen
       const emptyIsReal = (row.empty_weight !== null && row.empty_weight !== undefined);
       const emptyVal    = emptyIsReal ? parseFloat(row.empty_weight) : 0;
 
       if (net > 0 && full > 0 && emptyIsReal && emptyVal > 0) {
-        // Botella pesada: calcular porcentaje de llenado
         const qtyInGrams = toBaseGrams(qty, qtype);
         const pct = (qtyInGrams - emptyVal) / net;
         total += Math.max(0, pct);
-
       } else {
-        // A granel: la cantidad YA es el stock, solo convertir a unidades de contenedor
         const qtyInGrams = toBaseGrams(qty, qtype);
         const contBase   = parseFloat(containerSizeBaseUnit) || 1;
         total += contBase > 0 ? qtyInGrams / contBase : 0;
@@ -96,6 +83,29 @@ const calcStockUnits = (rows, containerSizeBaseUnit) => {
   }
 
   return total;
+};
+
+// ============================================
+// GENERATE ORDER NUMBER (inline — no SP)
+// ============================================
+const generateOrderNumber = async (connection, storeId) => {
+  const year = new Date().getFullYear();
+
+  const [[lastOrder]] = await connection.execute(
+    `SELECT order_number FROM orders 
+     WHERE id_store = ? AND order_number LIKE ?
+     ORDER BY id_orders DESC LIMIT 1`,
+    [storeId, `ORD-${year}-%`]
+  );
+
+  let nextNum = 1;
+  if (lastOrder?.order_number) {
+    const parts = lastOrder.order_number.split('-');
+    const parsed = parseInt(parts[2]);
+    if (!isNaN(parsed)) nextNum = parsed + 1;
+  }
+
+  return `ORD-${year}-${String(nextNum).padStart(3, '0')}`;
 };
 
 // ============================================
@@ -109,7 +119,6 @@ const calculateOrderSuggestions = async (req, res) => {
       return res.status(400).json({ message: 'Inventory ID and Store ID are required' });
     }
 
-    // 1. Obtener todos los productos del store con sus vendors, categoría y container_size_base_unit
     const [productsWithVendors] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -137,7 +146,7 @@ const calculateOrderSuggestions = async (req, res) => {
       [storeId]
     );
 
-    // 2. Obtener todos los inventory_items de esa fecha (raw, sin calcular stock en SQL)
+    // Items del inventario actual
     const [inventoryItems] = await pool.execute(
       `SELECT
         ii.id_product,
@@ -158,36 +167,97 @@ const calculateOrderSuggestions = async (req, res) => {
       [storeId, inventoryId]
     );
 
-    // Agrupar items por producto (puede haber múltiples ubicaciones)
+    // ── Fecha del inventario actual ───────────────────────────────────────────
+    const [[currentInvRow]] = await pool.execute(
+      'SELECT DATE(inventory_date) as inv_date FROM inventories WHERE id_inventories = ?',
+      [inventoryId]
+    );
+    const currentInvDate = currentInvRow?.inv_date || null;
+
+    // ── Inventario anterior (más reciente antes del actual, mismo store, locked) ──
+    const [[prevInvRow]] = await pool.execute(
+      `SELECT DATE(inventory_date) as inv_date
+       FROM inventories
+       WHERE id_store = ? AND status = 'Locked'
+         AND DATE(inventory_date) < ?
+       ORDER BY inventory_date DESC
+       LIMIT 1`,
+      [storeId, currentInvDate]
+    );
+    const prevInvDate = prevInvRow?.inv_date || null;
+
+    // ── Items del inventario anterior ─────────────────────────────────────────
+    const prevItemsByProduct = {};
+    if (prevInvDate) {
+      const [prevItems] = await pool.execute(
+        `SELECT ii.id_product, ii.quantity_type, ii.quantity,
+                ii.full_weight, ii.empty_weight, ii.net_weight
+         FROM inventory_items ii
+         INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+         WHERE i.id_store = ? AND i.status = 'Locked'
+           AND DATE(i.inventory_date) = ?`,
+        [storeId, prevInvDate]
+      );
+      prevItems.forEach(item => {
+        if (!prevItemsByProduct[item.id_product]) prevItemsByProduct[item.id_product] = [];
+        prevItemsByProduct[item.id_product].push(item);
+      });
+    }
+
+    // ── Compras (invoices) entre inventario anterior y actual ─────────────────
+    // ⚠️  Verifica que los nombres de tabla coincidan con tu esquema:
+    //     - Tabla de facturas:       invoices      (columnas: id_invoices, id_store, invoice_date)
+    //     - Tabla de items factura:  invoice_items (columnas: id_invoice, id_product, quantity)
+    // ── Compras (invoices) entre inventario anterior y actual ─────────────────
+    const purchaseByProduct = {};
+    if (prevInvDate && currentInvDate) {
+      try {
+        const [purchases] = await pool.execute(
+          `SELECT 
+             ii.id_product,
+             SUM(ii.received_qty) as total_qty
+           FROM invoice_items ii
+           INNER JOIN invoices inv ON ii.id_invoice = inv.id_invoice
+           LEFT JOIN orders o ON inv.id_order = o.id_orders
+           WHERE inv.id_store = ?
+             AND inv.status = 'Saved'
+             AND ii.received_qty IS NOT NULL
+             AND DATE(COALESCE(inv.invoice_date, o.sent_at, inv.created_at)) >= ?
+             AND DATE(COALESCE(inv.invoice_date, o.sent_at, inv.created_at)) < ?
+           GROUP BY ii.id_product`,
+          [storeId, prevInvDate, currentInvDate]
+        );
+        purchases.forEach(p => {
+          purchaseByProduct[p.id_product] = parseFloat(p.total_qty) || 0;
+        });
+      } catch (e) {
+        console.warn('⚠️  Error fetching purchases:', e.message);
+      }
+    }
+
+    // ── Agrupar items del inventario actual por producto ──────────────────────
     const itemsByProduct = {};
     inventoryItems.forEach(item => {
-      if (!itemsByProduct[item.id_product]) {
-        itemsByProduct[item.id_product] = [];
-      }
+      if (!itemsByProduct[item.id_product]) itemsByProduct[item.id_product] = [];
       itemsByProduct[item.id_product].push(item);
     });
 
-    // Set de productos que sí fueron contados en el inventario
     const countedProductIds = new Set(Object.keys(itemsByProduct).map(Number));
 
-    // Map de productos para lookup rápido
     const productMap = {};
-    productsWithVendors.forEach(p => {
-      productMap[p.id_products] = p;
-    });
+    productsWithVendors.forEach(p => { productMap[p.id_products] = p; });
 
-    // 3. Calcular stock en unidades de contenedor por producto
+    // ── Stock on hand actual ──────────────────────────────────────────────────
     const stockMap = {};
     countedProductIds.forEach(productId => {
       const rows    = itemsByProduct[productId];
       const product = productMap[productId];
       if (!product) return;
-
       const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
       stockMap[productId] = calcStockUnits(rows, containerSizeBaseUnit);
     });
 
-    // 4. Calcular sugerencias por vendor
+    // ── Armar grupos por vendor ───────────────────────────────────────────────
     const vendorGroups = {};
 
     productsWithVendors.forEach(product => {
@@ -203,34 +273,47 @@ const calculateOrderSuggestions = async (req, res) => {
         };
       }
 
-      const stockOnHand  = stockMap[product.id_products] !== undefined
-        ? stockMap[product.id_products]
-        : 0;
-
+      const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
+      const stockOnHand   = stockMap[product.id_products] !== undefined ? stockMap[product.id_products] : 0;
       const reorderPoint  = parseFloat(product.reorder_point) || 0;
       const par           = parseFloat(product.par)           || 0;
       const caseSize      = parseFloat(product.case_size)     || 1;
       const orderBy       = product.order_by || product.container_type;
       const isOrderByCase = orderBy === 'Case';
 
-      // Convertir par y reorder a cajas si order_by = Case
-      const parForCalc     = isOrderByCase ? par / caseSize          : par;
-      const reorderForCalc = isOrderByCase ? reorderPoint / caseSize  : reorderPoint;
-      const stockForCalc   = isOrderByCase ? stockOnHand / caseSize   : stockOnHand;
+      const parForCalc     = isOrderByCase ? par / caseSize         : par;
+      const reorderForCalc = isOrderByCase ? reorderPoint / caseSize : reorderPoint;
+      const stockForCalc   = isOrderByCase ? stockOnHand / caseSize  : stockOnHand;
 
-      // Precio
       const wholesalePrice = parseFloat(product.wholesale_price) || 0;
       const unitPrice = isOrderByCase
         ? wholesalePrice
         : (caseSize > 0 ? wholesalePrice / caseSize : wholesalePrice);
 
-      // Sugerido
       let suggestedOrder = 0;
       if (stockForCalc <= reorderForCalc) {
         const unitsNeeded = parForCalc - stockForCalc;
         suggestedOrder = Math.ceil(unitsNeeded);
         if (suggestedOrder < 0) suggestedOrder = 0;
       }
+
+      // ── Opening Last Inv ────────────────────────────────────────────────────
+      const prevRows   = prevItemsByProduct[product.id_products] || [];
+      const openingRaw = prevRows.length > 0
+        ? calcStockUnits(prevRows, containerSizeBaseUnit)
+        : 0;
+      const openingLastInv = isOrderByCase ? openingRaw / caseSize : openingRaw;
+
+      // ── Purchase (facturas entre inventario anterior y actual) ──────────────
+      // Las cantidades en invoice_items se asumen en unidades de contenedor (botellas, etc.)
+      const purchaseRaw = purchaseByProduct[product.id_products] || 0;
+      const purchase = purchaseRaw;
+
+      // ── Sold (0 por ahora) ──────────────────────────────────────────────────
+      const sold = 0;
+
+      // ── Variance = Stock on hand - (Opening + Purchase) + Sold ─────────────
+      const variance = stockForCalc - (openingLastInv + purchase) + sold;
 
       vendorGroups[vendorId].products.push({
         id_product:                product.id_products,
@@ -239,8 +322,15 @@ const calculateOrderSuggestions = async (req, res) => {
         container_size:            product.container_size,
         container_unit:            product.container_unit,
         category_name:             product.category_name || 'Uncategorized',
-        stock_on_hand:             parseFloat(stockForCalc.toFixed(2)),
+        // Stock actual
+        stock_on_hand:             parseFloat(stockForCalc.toFixed(4)),
         stock_on_hand_raw:         parseFloat(stockOnHand.toFixed(4)),
+        // Nuevos campos
+        opening_last_inv:          parseFloat(openingLastInv.toFixed(4)),
+        purchase:                  parseFloat(purchase.toFixed(4)),
+        sold,
+        variance:                  parseFloat(variance.toFixed(4)),
+        // Existentes
         reorder_point:             reorderPoint,
         par,
         case_size:                 caseSize,
@@ -254,7 +344,12 @@ const calculateOrderSuggestions = async (req, res) => {
 
     res.json({
       success: true,
-      data: { inventory_id: inventoryId, vendors: Object.values(vendorGroups) }
+      data: {
+        inventory_id:   inventoryId,
+        current_date:   currentInvDate,
+        prev_date:      prevInvDate,
+        vendors:        Object.values(vendorGroups)
+      }
     });
 
   } catch (error) {
@@ -274,12 +369,11 @@ const createOrder = async (req, res) => {
     const { storeId, vendorId, inventoryId, items, notes, createdBy } = req.body;
 
     if (!storeId || !vendorId || !items || items.length === 0) {
+      await connection.rollback();
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
-    await connection.execute('CALL sp_generate_order_number(?, @order_number)', [storeId]);
-    const [rows] = await connection.execute('SELECT @order_number as order_number');
-    const orderNumber = rows[0];
+    const orderNumber = await generateOrderNumber(connection, storeId);
 
     let totalItems  = 0;
     let totalAmount = 0;
@@ -293,7 +387,7 @@ const createOrder = async (req, res) => {
     const [orderResult] = await connection.execute(
       `INSERT INTO orders (id_store, id_vendor, id_inventory, order_number, order_date, status, total_items, total_amount, notes, created_by)
        VALUES (?, ?, ?, ?, NOW(), 'Draft', ?, ?, ?, ?)`,
-      [storeId, vendorId, inventoryId, orderNumber.order_number, totalItems, totalAmount, notes, createdBy]
+      [storeId, vendorId, inventoryId, orderNumber, totalItems, totalAmount, notes, createdBy]
     );
 
     const orderId = orderResult.insertId;
@@ -321,7 +415,7 @@ const createOrder = async (req, res) => {
     }
 
     await connection.commit();
-    res.json({ success: true, message: 'Order created successfully', data: { order_id: orderId, order_number: orderNumber.order_number } });
+    res.json({ success: true, message: 'Order created successfully', data: { order_id: orderId, order_number: orderNumber } });
   } catch (error) {
     await connection.rollback();
     console.error('Error creating order:', error);
@@ -430,15 +524,13 @@ const sendOrderEmail = async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error sending order email:', error);
-    console.error('❌ sendOrderEmail error:', error.message);
-    console.error('❌ Stack:', error.stack);
 
     if (error.message?.toLowerCase().includes('payload') ||
         error.message?.toLowerCase().includes('413') ||
         error.message?.toLowerCase().includes('large')) {
       return res.status(413).json({
         success: false,
-        message: 'Order has too many items to send via email. Consider splitting the order or using a different method.',
+        message: 'Order has too many items to send via email.',
         error: 'Payload too large',
         items_count: req.body.items?.length || 'unknown'
       });
@@ -578,6 +670,9 @@ const getOrdersForView = async (req, res) => {
   }
 };
 
+// ============================================
+// DELETE ORDER
+// ============================================
 const deleteOrder = async (req, res) => {
   try {
     const { id } = req.params;
