@@ -129,13 +129,13 @@ const generateOrderEmailHTML = (orderData) => {
       ` : ''}
 
       <div style="margin-top:30px;padding:20px;background-color:#f8fafc;border-radius:8px;font-size:13px;color:#475569;">
-        <p style="margin:0;"><strong>Important:</strong> This is an automated purchase order from our Kitchen Inventory Management System.</p>
+        <p style="margin:0;"><strong>Important:</strong> This is an automated purchase order from our Inventory Management System.</p>
         <p style="margin:10px 0 0 0;font-size:12px;">Please review the order and confirm receipt with an estimated delivery date.</p>
       </div>
     </div>
     <div style="text-align:center;margin-top:20px;padding:20px;font-size:12px;color:#94a3b8;">
       <p style="margin:5px 0;">This email was sent from ${escapeHtml(store_name)}</p>
-      <p style="margin:5px 0;">Kitchen Inventory Management System</p>
+      <p style="margin:5px 0;">Inventory Management System</p>
     </div>
   </div>
 </body>
@@ -153,7 +153,7 @@ const sendOrderEmail = async (orderData) => {
   console.log(`Preparing email for order ${order_number} to ${vendor_email} with ${items?.length || 0} items`);
 
   const mailOptions = {
-    from:    `"${process.env.EMAIL_FROM_NAME || ' Kitechen Inventory System'}" <${process.env.EMAIL_USER}>`,
+    from:    `"${process.env.EMAIL_FROM_NAME || 'Inventory System'}" <${process.env.EMAIL_USER}>`,
     to:      vendor_email,
     subject: `Purchase Order ${order_number} from ${store_name}`,
     html:    generateOrderEmailHTML(orderData),
@@ -200,6 +200,7 @@ const sendInvoiceDiscrepancyEmail = async ({
       <thead>
         <tr style="background:#f1f5f9;">
           <th style="padding:8px 12px;text-align:left;color:#475569;">Product</th>
+          <th style="padding:8px 12px;text-align:center;color:#475569;">Order</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Qty Received</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Unit Price</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Subtotal</th>
@@ -216,6 +217,7 @@ const sendInvoiceDiscrepancyEmail = async ({
                 ${escapeHtml(item.product_name)}
                 ${item.product_code ? `<span style="font-size:11px;color:#94a3b8;margin-left:6px;">${escapeHtml(item.product_code)}</span>` : ''}
               </td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:600;">0</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:600;">${qty}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">${formatCurrency(price)}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:600;color:#0ea5e9;">${formatCurrency(subtotal)}</td>

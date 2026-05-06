@@ -136,13 +136,15 @@ const calculateOrderSuggestions = async (req, res) => {
         v.id_vendors,
         v.vendor_name,
         v.email as vendor_email,
-        c.category_name
+        c.category_name,
+        pt.product_name AS product_type_name
       FROM products p
       INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
       LEFT JOIN vendors v ON p.id_vendor = v.id_vendors
       LEFT JOIN categories c ON p.id_category = c.id_categories
+      LEFT JOIN product_types pt ON c.id_product_types = pt.id_product_types
       WHERE pbs.id_store = ?
-      ORDER BY v.vendor_name, c.category_name, p.product_name`,
+      ORDER BY v.vendor_name, pt.product_name, c.category_name, p.product_name`,
       [storeId]
     );
 
@@ -322,6 +324,7 @@ const calculateOrderSuggestions = async (req, res) => {
         container_size:            product.container_size,
         container_unit:            product.container_unit,
         category_name:             product.category_name || 'Uncategorized',
+        product_type_name:         product.product_name || 'Other',
         // Stock actual
         stock_on_hand:             parseFloat(stockForCalc.toFixed(4)),
         stock_on_hand_raw:         parseFloat(stockOnHand.toFixed(4)),
