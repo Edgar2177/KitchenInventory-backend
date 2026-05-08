@@ -142,7 +142,7 @@ const calculateOrderSuggestions = async (req, res) => {
       INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
       LEFT JOIN vendors v ON p.id_vendor = v.id_vendors
       LEFT JOIN categories c ON p.id_category = c.id_categories
-      LEFT JOIN product_types pt ON c.id_product_types = pt.id_product_types
+      LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
       WHERE pbs.id_store = ?
       ORDER BY v.vendor_name, pt.product_name, c.category_name, p.product_name`,
       [storeId]
@@ -176,7 +176,7 @@ const calculateOrderSuggestions = async (req, res) => {
     );
     const currentInvDate = currentInvRow?.inv_date || null;
 
-    // ── Inventario anterior (más reciente antes del actual, mismo store, locked) ──
+    // ── Inventario anterior ───────────────────────────────────────────────────
     const [[prevInvRow]] = await pool.execute(
       `SELECT DATE(inventory_date) as inv_date
        FROM inventories
@@ -206,11 +206,7 @@ const calculateOrderSuggestions = async (req, res) => {
       });
     }
 
-    // ── Compras (invoices) entre inventario anterior y actual ─────────────────
-    // ⚠️  Verifica que los nombres de tabla coincidan con tu esquema:
-    //     - Tabla de facturas:       invoices      (columnas: id_invoices, id_store, invoice_date)
-    //     - Tabla de items factura:  invoice_items (columnas: id_invoice, id_product, quantity)
-    // ── Compras (invoices) entre inventario anterior y actual ─────────────────
+    // ── Compras entre inventario anterior y actual ────────────────────────────
     const purchaseByProduct = {};
     if (prevInvDate && currentInvDate) {
       try {
@@ -306,15 +302,14 @@ const calculateOrderSuggestions = async (req, res) => {
         : 0;
       const openingLastInv = isOrderByCase ? openingRaw / caseSize : openingRaw;
 
-      // ── Purchase (facturas entre inventario anterior y actual) ──────────────
-      // Las cantidades en invoice_items se asumen en unidades de contenedor (botellas, etc.)
+      // ── Purchase ────────────────────────────────────────────────────────────
       const purchaseRaw = purchaseByProduct[product.id_products] || 0;
       const purchase = purchaseRaw;
 
-      // ── Sold (0 por ahora) ──────────────────────────────────────────────────
+      // ── Sold ────────────────────────────────────────────────────────────────
       const sold = 0;
 
-      // ── Variance = Stock on hand - (Opening + Purchase) + Sold ─────────────
+      // ── Variance ────────────────────────────────────────────────────────────
       const variance = stockForCalc - (openingLastInv + purchase) + sold;
 
       vendorGroups[vendorId].products.push({
@@ -324,16 +319,13 @@ const calculateOrderSuggestions = async (req, res) => {
         container_size:            product.container_size,
         container_unit:            product.container_unit,
         category_name:             product.category_name || 'Uncategorized',
-        product_type_name:         product.product_name || 'Other',
-        // Stock actual
+        product_type_name:         product.product_type_name || 'Other',
         stock_on_hand:             parseFloat(stockForCalc.toFixed(4)),
         stock_on_hand_raw:         parseFloat(stockOnHand.toFixed(4)),
-        // Nuevos campos
         opening_last_inv:          parseFloat(openingLastInv.toFixed(4)),
         purchase:                  parseFloat(purchase.toFixed(4)),
         sold,
         variance:                  parseFloat(variance.toFixed(4)),
-        // Existentes
         reorder_point:             reorderPoint,
         par,
         case_size:                 caseSize,
@@ -471,7 +463,7 @@ const sendOrderEmail = async (req, res) => {
     const { id } = req.params;
     const emailConfig = req.body;
 
-    console.log(`📧 Sending order ${id} with ${emailConfig.items?.length || 'unknown'} items`);
+    console.log(`📧 Sending order ${id} — requested by: ${emailConfig.sentBy || 'System'}`);
 
     const [orders] = await pool.execute('SELECT * FROM v_orders_with_details WHERE id_orders = ?', [id]);
     if (orders.length === 0) {
@@ -501,6 +493,7 @@ const sendOrderEmail = async (req, res) => {
       order_date:   order.order_date,
       store_name:   order.store_name,
       vendor_name:  order.vendor_name,
+      sent_by:      emailConfig.sentBy || 'System',   // ← usuario que envió
       items: items.map(item => ({
         product_code: item.product_code || '-',
         product_name: item.product_name,
@@ -516,7 +509,7 @@ const sendOrderEmail = async (req, res) => {
 
     await pool.execute('UPDATE orders SET status = ?, sent_at = NOW() WHERE id_orders = ?', ['Sent', id]);
 
-    console.log(`✅ Order ${id} sent successfully with ${items.length} items`);
+    console.log(`✅ Order ${id} sent by ${emailData.sent_by} — ${items.length} items`);
 
     res.json({
       success: true,

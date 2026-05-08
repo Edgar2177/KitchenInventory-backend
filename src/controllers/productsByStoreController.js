@@ -52,14 +52,16 @@ const getProductsByStoreId = async (req, res) => {
         p.full_weight_base_unit as fullWeightBaseUnit,
         p.empty_weight_base_unit as emptyWeightBaseUnit,
         c.category_name as categoryName,
+        pt.product_name AS productTypeName,
         ps.par as par,
         ps.reorder_point as reorderPoint,
         ps.order_by_the as orderByThe
       FROM products_by_store ps
       INNER JOIN products p ON ps.id_product = p.id_products
       LEFT JOIN categories c ON p.id_category = c.id_categories
+      LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
       WHERE ps.id_store = ?
-      ORDER BY p.product_name
+      ORDER BY pt.product_name, c.category_name, p.product_name
     `;
     const [rows] = await pool.execute(query, [storeId]);
     res.json({ success: true, data: rows });

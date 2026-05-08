@@ -46,7 +46,16 @@ const formatCurrency = (v) =>
 // Generar HTML para el email de orden
 // ============================================================
 const generateOrderEmailHTML = (orderData) => {
-  const { order_number, order_date, store_name, vendor_name, items, total_amount, total_items } = orderData;
+  const {
+    order_number,
+    order_date,
+    store_name,
+    vendor_name,
+    items,
+    total_amount,
+    total_items,
+    sent_by       // ← usuario que generó la orden
+  } = orderData;
 
   const MAX_ITEMS = 100;
   const displayItems     = items.slice(0, MAX_ITEMS);
@@ -75,11 +84,17 @@ const generateOrderEmailHTML = (orderData) => {
 </head>
 <body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background-color:#f8fafc;">
   <div style="max-width:900px;margin:0 auto;padding:20px;">
+
+    <!-- Header -->
     <div style="background:linear-gradient(135deg,#0ea5e9 0%,#0284c7 100%);padding:30px;border-radius:12px 12px 0 0;color:white;">
       <h1 style="margin:0;font-size:28px;font-weight:600;">Purchase Order</h1>
       <p style="margin:10px 0 0 0;font-size:24px;font-weight:500;opacity:0.95;">#${escapeHtml(order_number)}</p>
     </div>
+
+    <!-- Body -->
     <div style="background:white;padding:30px;border-radius:0 0 12px 12px;box-shadow:0 4px 6px rgba(0,0,0,0.05);">
+
+      <!-- Meta info -->
       <div style="margin-bottom:30px;padding-bottom:20px;border-bottom:2px solid #e2e8f0;">
         <div style="display:flex;justify-content:space-between;flex-wrap:wrap;">
           <div style="margin-bottom:15px;">
@@ -101,8 +116,16 @@ const generateOrderEmailHTML = (orderData) => {
             <p style="margin:5px 0 0 0;font-size:14px;color:#475569;font-weight:600;">${total_items || items.length}</p>
           </div>
         </div>
+
+        <!-- Sent by -->
+        <div style="margin-top:16px;padding:12px 16px;background:#f0f9ff;border-left:4px solid #0ea5e9;border-radius:0 6px 6px 0;">
+          <p style="margin:0;font-size:13px;color:#0c4a6e;">
+            <strong>Sent by:</strong> ${escapeHtml(sent_by || 'System')}
+          </p>
+        </div>
       </div>
 
+      <!-- Tabla de productos -->
       ${items.length > 0 ? `
       <div style="overflow-x:auto;">
         <table style="width:100%;border-collapse:collapse;font-size:14px;">
@@ -128,11 +151,14 @@ const generateOrderEmailHTML = (orderData) => {
       </div>
       ` : ''}
 
+      <!-- Footer de la tarjeta -->
       <div style="margin-top:30px;padding:20px;background-color:#f8fafc;border-radius:8px;font-size:13px;color:#475569;">
         <p style="margin:0;"><strong>Important:</strong> This is an automated purchase order from our Inventory Management System.</p>
         <p style="margin:10px 0 0 0;font-size:12px;">Please review the order and confirm receipt with an estimated delivery date.</p>
       </div>
     </div>
+
+    <!-- Pie de página -->
     <div style="text-align:center;margin-top:20px;padding:20px;font-size:12px;color:#94a3b8;">
       <p style="margin:5px 0;">This email was sent from ${escapeHtml(store_name)}</p>
       <p style="margin:5px 0;">Inventory Management System</p>
@@ -183,12 +209,10 @@ const sendInvoiceDiscrepancyEmail = async ({
   receipt_url      = null,
   total_amount     = null,
   no_order         = false,
-  items            = []   // solo usado en no_order
+  items            = []
 }) => {
   const toList = recipients.map(r => r.email).join(', ');
 
-  // ── Subject ──────────────────────────────────────────────
-  // Evita el "null" cuando no hay orden
   const subjectOrderPart = order_number ? order_number : 'No Order';
   const subjectPrefix    = no_order ? ' No-Order Invoice' : 'Invoice Discrepancy';
   const subject          = `${subjectPrefix} — ${subjectOrderPart} (${store_name})`;
@@ -236,7 +260,7 @@ const sendInvoiceDiscrepancyEmail = async ({
     </table>
   ` : '';
 
-  // ── Sección: discrepancias de cantidad (solo modo normal) ─
+  // ── Sección: discrepancias de cantidad ────────────────────
   const discrepancySection = !no_order && discrepancies.length > 0 ? `
     <h3 style="color:#b45309;margin:0 0 8px;font-size:14px;">Quantity Discrepancies</h3>
     <table style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -301,25 +325,16 @@ const sendInvoiceDiscrepancyEmail = async ({
     </div>
   ` : '';
 
-  // ── Header color según tipo ───────────────────────────────
   const headerBg    = no_order ? '#7c3aed' : '#0ea5e9';
-  const headerIcon  = no_order ? '' : '';
   const headerTitle = no_order ? 'No-Order Invoice' : 'Invoice Quantity Discrepancy';
 
-  // ── HTML completo ─────────────────────────────────────────
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;">
-
-      <!-- Header -->
       <div style="background:${headerBg};padding:20px 24px;border-radius:8px 8px 0 0;">
-        <h2 style="color:#fff;margin:0;font-size:18px;">${headerIcon} ${headerTitle}</h2>
+        <h2 style="color:#fff;margin:0;font-size:18px;">${headerTitle}</h2>
         <p style="color:rgba(255,255,255,0.85);margin:4px 0 0;font-size:13px;">${escapeHtml(store_name)}</p>
       </div>
-
-      <!-- Body -->
       <div style="background:#fff;border:1px solid #e2e8f0;border-top:none;padding:24px;border-radius:0 0 8px 8px;">
-
-        <!-- Meta info -->
         <div style="margin-bottom:20px;">
           ${order_number ? `
           <p style="color:#475569;font-size:14px;margin:0 0 4px;">
@@ -345,14 +360,10 @@ const sendInvoiceDiscrepancyEmail = async ({
           </p>
           ` : ''}
         </div>
-
-        <!-- Contenido según tipo -->
         ${noOrderItemsSection}
         ${discrepancySection}
         ${priceSection}
         ${receiptSection}
-
-        <!-- Footer -->
         <p style="font-size:12px;color:#94a3b8;margin-top:24px;border-top:1px solid #f1f5f9;padding-top:16px;">
           This is an automated notification from your Inventory System.
         </p>
