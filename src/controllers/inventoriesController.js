@@ -35,21 +35,31 @@ const getLastInventoryOrder = async (locationId) => {
   return result;
 };
 
+// ── FIX 1: usa full_weight_base_unit y empty_weight_base_unit (ya en gramos) ──
 const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmptyWeight) => {
-  let fullWeight  = itemFullWeight  ? parseFloat(itemFullWeight)  : null;
-  let emptyWeight = itemEmptyWeight !== undefined && itemEmptyWeight !== null && itemEmptyWeight !== ''
-    ? parseFloat(itemEmptyWeight)
-    : null;
+  // Siempre tomar los valores base (gramos) desde la tabla products
+  const [product] = await connection.execute(
+    `SELECT full_weight_base_unit as full_weight,
+            empty_weight_base_unit as empty_weight
+     FROM products WHERE id_products = ?`,
+    [productId]
+  );
 
-  if (!fullWeight || emptyWeight === null) {
-    const [product] = await connection.execute(
-      `SELECT full_weight, empty_weight FROM products WHERE id_products = ?`,
-      [productId]
-    );
-    if (product.length > 0) {
-      fullWeight  = fullWeight  ?? (parseFloat(product[0].full_weight)  || null);
-      emptyWeight = emptyWeight ?? (product[0].empty_weight !== null ? parseFloat(product[0].empty_weight) : null);
-    }
+  let fullWeight  = null;
+  let emptyWeight = null;
+
+  if (product.length > 0) {
+    fullWeight  = product[0].full_weight  != null ? parseFloat(product[0].full_weight)  : null;
+    emptyWeight = product[0].empty_weight != null ? parseFloat(product[0].empty_weight) : null;
+  }
+
+  // Fallback: si el producto no tiene base_unit guardado, usar los valores del item
+  // (esto cubre productos viejos que aún no tienen base_unit calculado)
+  if (fullWeight === null && itemFullWeight) {
+    fullWeight = parseFloat(itemFullWeight) || null;
+  }
+  if (emptyWeight === null && itemEmptyWeight != null && itemEmptyWeight !== '') {
+    emptyWeight = parseFloat(itemEmptyWeight) ?? null;
   }
 
   if (fullWeight && emptyWeight !== null && fullWeight > emptyWeight) {
@@ -87,6 +97,7 @@ const calcProductWeight = (quantity, quantityType, fullWeight, emptyWeight, netW
     const netVal     = parseFloat(netWeight) || 0;
     const fullVal    = parseFloat(fullWeight) || 0;
 
+    // fullWeight, emptyWeight y netWeight ya están en gramos (base_unit)
     if (netVal > 0 && fullVal > 0 && emptyVal > 0) {
       const productWeightGrams = qtyInGrams - emptyVal;
       return {
@@ -108,8 +119,6 @@ const calcProductWeight = (quantity, quantityType, fullWeight, emptyWeight, netW
 
 // ========================================
 // CALCULAR WHOLESALE VALUE DE UN PREP
-// quantity = cantidad capturada, quantityType = unidad capturada
-// yieldQuantity + yieldUnit + totalCost vienen del prep
 // ========================================
 const calcPrepWholesaleValue = (quantity, quantityType, yieldQuantity, yieldUnit, totalCost) => {
   const qty       = parseFloat(quantity)      || 0;
@@ -118,12 +127,10 @@ const calcPrepWholesaleValue = (quantity, quantityType, yieldQuantity, yieldUnit
 
   if (qty <= 0 || yieldQty <= 0 || cost <= 0) return 0;
 
-  // Misma unidad: directo
   if (quantityType === yieldUnit) {
     return (cost / yieldQty) * qty;
   }
 
-  // Convertir ambas a base unit y calcular
   const qtyBase   = qty      * (GRAMS[quantityType] || 1);
   const yieldBase = yieldQty * (GRAMS[yieldUnit]    || 1);
 
@@ -215,7 +222,7 @@ const getInventoryById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Inventory not found' });
     }
 
-    // Items — productos
+    // ── FIX 4: usa full_weight_base_unit (gramos) como product_full_weight ──
     const [items] = await pool.execute(
       `SELECT 
         ii.*,
@@ -225,8 +232,8 @@ const getInventoryById = async (req, res) => {
         p.container_size,
         p.container_unit,
         p.case_size,
-        p.full_weight as product_full_weight,
-        p.empty_weight as product_empty_weight,
+        p.full_weight_base_unit  as product_full_weight,
+        p.empty_weight_base_unit as product_empty_weight,
         p.wholesale_price,
         l.location_name
        FROM inventory_items ii
@@ -237,7 +244,6 @@ const getInventoryById = async (req, res) => {
       [id]
     );
 
-    // Prep items
     const [prepItems] = await pool.execute(
       `SELECT 
         ii.*,
@@ -277,7 +283,7 @@ const getAvailableProducts = async (req, res) => {
       return res.status(400).json({ success: false, message: 'storeId es requerido' });
     }
 
-    // Productos
+    // ── FIX 2: usa full_weight_base_unit y empty_weight_base_unit (ya en gramos) ──
     const [products] = await pool.execute(
       `SELECT 
         p.id_products as id,
@@ -290,8 +296,8 @@ const getAvailableProducts = async (req, res) => {
         p.container_size_base_unit_type,
         p.case_size,
         p.wholesale_price,
-        p.full_weight,
-        p.empty_weight,
+        p.full_weight_base_unit  as full_weight,
+        p.empty_weight_base_unit as empty_weight,
         p.full_weight_unit as weight_unit,
         pbs.par,
         pbs.reorder_point,
@@ -303,7 +309,6 @@ const getAvailableProducts = async (req, res) => {
       [storeId]
     );
 
-    // Preps de la tienda
     const [preps] = await pool.execute(
       `SELECT 
         id_preps as id,
@@ -355,7 +360,6 @@ const createInventory = async (req, res) => {
       }
     }
 
-    // Ordenar productos
     let finalItems = [];
     if (items && items.length > 0) {
       if (status === 'Locked') {
@@ -388,7 +392,6 @@ const createInventory = async (req, res) => {
       ];
     }
 
-    // Ordenar preps
     let finalPrepItems = [];
     if (prepItems && prepItems.length > 0) {
       if (status === 'Locked') {
@@ -411,7 +414,6 @@ const createInventory = async (req, res) => {
 
     let totalWsValue = 0;
 
-    // Insertar productos
     for (const item of finalItems) {
       const quantity = parseFloat(item.quantity);
       if (isNaN(quantity)) {
@@ -419,6 +421,7 @@ const createInventory = async (req, res) => {
         return res.status(400).json({ success: false, message: `Invalid quantity for product: ${item.productName}` });
       }
       const wsValue = parseFloat(item.wholesaleValue) || 0;
+      // calculateNetWeight ahora usa full_weight_base_unit (gramos) internamente
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
       const pw      = calcProductWeight(quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
@@ -441,7 +444,6 @@ const createInventory = async (req, res) => {
       totalWsValue += wsValue;
     }
 
-    // Insertar preps
     for (const item of finalPrepItems) {
       const quantity = parseFloat(item.quantity);
       if (isNaN(quantity)) {
@@ -460,23 +462,21 @@ const createInventory = async (req, res) => {
           wholesale_value
         ) VALUES (?, NULL, ?, 'prep', ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)`,
         [
-          inventoryId,          // id_inventory
-          item.prepId,          // id_prep
-          item.locationId || null, // id_location
-          item.order,           // display_order
-          item.quantityType,    // quantity_type
-          quantity,             // quantity
-          // case_size, full_weight, empty_weight, net_weight → NULL (ya en el query)
-          quantity,             // product_weight
-          quantity,             // product_weight_grams
-          item.quantityType,    // product_weight_unit
-          wsValue               // wholesale_value
+          inventoryId,
+          item.prepId,
+          item.locationId || null,
+          item.order,
+          item.quantityType,
+          quantity,
+          quantity,
+          quantity,
+          item.quantityType,
+          wsValue
         ]
       );
       totalWsValue += wsValue;
     }
 
-    // Waste
     let totalWasteValue = 0;
     for (const w of waste) {
       const wsValue = parseFloat(w.wholesaleValue) || 0;
@@ -565,12 +565,12 @@ const updateInventory = async (req, res) => {
 
       let totalWsValue = 0;
 
-      // Insertar productos
       for (const item of (items || [])) {
         const wsValue = parseFloat(item.wholesaleValue) || 0;
+        // calculateNetWeight ahora usa full_weight_base_unit (gramos) internamente
         const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
         const pw      = calcProductWeight(parseFloat(item.quantity), item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
-      
+
         await connection.execute(
           `INSERT INTO inventory_items (
             id_inventory, id_product, id_prep, item_type, id_location, display_order,
@@ -590,7 +590,6 @@ const updateInventory = async (req, res) => {
         totalWsValue += wsValue;
       }
 
-      // Insertar preps
       for (const item of prepItems) {
         const quantity = parseFloat(item.quantity);
         const wsValue  = parseFloat(item.wholesaleValue) || 0;
@@ -710,14 +709,15 @@ const getLastInventoryProducts = async (req, res) => {
 
     const lastInventoryId = lastInventory[0].id_inventories;
 
-    // Productos
+    // ── FIX 3: usa full_weight_base_unit y empty_weight_base_unit (ya en gramos) ──
     const [items] = await pool.execute(
       `SELECT 
         ii.display_order, ii.quantity_type, ii.full_weight, ii.empty_weight, ii.net_weight,
         p.id_products as productId, p.product_name as productName, p.product_code as productCode,
         p.container_type as containerType, p.container_size as containerSize,
         p.container_unit as containerUnit, p.case_size as caseSize,
-        p.full_weight as product_full_weight, p.empty_weight as product_empty_weight,
+        p.full_weight_base_unit  as product_full_weight,
+        p.empty_weight_base_unit as product_empty_weight,
         p.wholesale_price as wholesalePrice
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
@@ -726,7 +726,6 @@ const getLastInventoryProducts = async (req, res) => {
       [lastInventoryId]
     );
 
-    // Preps
     const [prepData] = await pool.execute(
       `SELECT 
         ii.display_order, ii.quantity_type,
@@ -747,7 +746,7 @@ const getLastInventoryProducts = async (req, res) => {
 };
 
 // ========================================
-// IMPORTAR INVENTARIO DESDE EXCEL (sin cambios)
+// IMPORTAR INVENTARIO DESDE EXCEL
 // ========================================
 const importInventoryFromExcel = async (req, res) => {
   const connection = await pool.getConnection();
@@ -785,9 +784,11 @@ const importInventoryFromExcel = async (req, res) => {
         let productRow = null;
 
         if (productCode) {
+          // ── usa full_weight_base_unit y empty_weight_base_unit (gramos) ──
           const [byCode] = await connection.execute(
             `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
-               p.full_weight_base_unit as full_weight, p.empty_weight_base_unit as empty_weight,
+               p.full_weight_base_unit  as full_weight,
+               p.empty_weight_base_unit as empty_weight,
                p.wholesale_price, p.case_size, p.container_size, p.container_unit
              FROM products p
              INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
@@ -800,7 +801,8 @@ const importInventoryFromExcel = async (req, res) => {
         if (!productRow && productName) {
           const [byName] = await connection.execute(
             `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
-               p.full_weight_base_unit as full_weight, p.empty_weight_base_unit as empty_weight,
+               p.full_weight_base_unit  as full_weight,
+               p.empty_weight_base_unit as empty_weight,
                p.wholesale_price, p.case_size, p.container_size, p.container_unit
              FROM products p
              INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
@@ -828,6 +830,7 @@ const importInventoryFromExcel = async (req, res) => {
           if (containerTypes.includes(weightType)) {
             wholesaleValue = quantity * unitPrice;
           } else if (productRow.full_weight && productRow.empty_weight !== null) {
+            // full_weight y empty_weight ya están en gramos (base_unit)
             const full  = parseFloat(productRow.full_weight);
             const empty = parseFloat(productRow.empty_weight);
             if (full > empty) {
@@ -865,6 +868,7 @@ const importInventoryFromExcel = async (req, res) => {
 
     let totalWsValue = 0;
     for (const item of items) {
+      // calculateNetWeight ya usa base_unit internamente
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
       const pw      = calcProductWeight(item.quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
@@ -921,7 +925,7 @@ const getProductsForPrintInventory = async (req, res) => {
       return res.json({ success: true, data: [], message: 'No locked inventory found for this location' });
     }
 
-    // Productos
+    // full_weight y empty_weight en inventory_items ya están en gramos (guardados desde base_unit)
     const [productItems] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -958,7 +962,6 @@ const getProductsForPrintInventory = async (req, res) => {
       [lastInventory[0].id_inventories]
     );
 
-    // Preps
     const [prepItems] = await pool.execute(
       `SELECT
         pr.id_preps,
@@ -979,7 +982,6 @@ const getProductsForPrintInventory = async (req, res) => {
     res.json({ success: true, data: [...productItems, ...prepItems] });
   } catch (error) {
     console.error('❌ print error:', error.message);
-    console.error('SQL:', error.sql);
     res.status(500).json({ success: false, message: 'Error fetching products for print', error: error.message });
   }
 };
