@@ -489,6 +489,7 @@ const sendOrderEmail = async (req, res) => {
 
     const emailData = {
       vendor_email: emailConfig.to || order.vendor_email,
+      cc:           emailConfig.cc || null,
       order_number: order.order_number,
       order_date:   order.order_date,
       store_name:   order.store_name,

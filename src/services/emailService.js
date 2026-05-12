@@ -179,9 +179,10 @@ const sendOrderEmail = async (orderData) => {
   console.log(`Preparing email for order ${order_number} to ${vendor_email} with ${items?.length || 0} items`);
 
   const mailOptions = {
-    from:    `"${process.env.EMAIL_FROM_NAME || 'Inventory System'}" <${process.env.EMAIL_USER}>`,
+    from:    `"${store_name}" <${process.env.EMAIL_USER}>`,
     to:      vendor_email,
-    subject: `Purchase Order ${order_number} from ${store_name}`,
+    cc:      orderData.cc || undefined,
+    subject: `Purchase Order - ${order_number}`,
     html:    generateOrderEmailHTML(orderData),
   };
 

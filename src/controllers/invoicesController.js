@@ -213,7 +213,8 @@ const saveInvoice = async (req, res) => {
       createdBy,
       receiptUrl,
       receiptPublicId,
-      invoiceDate,        // ← fecha editable (solo no-order)
+      invoiceDate,
+      silent  = false,   // ← si true: guarda como Draft, no manda correo
       noOrder = false
     } = req.body;
 
@@ -230,6 +231,9 @@ const saveInvoice = async (req, res) => {
       return res.status(400).json({ success: false, message: 'vendorId is required for no-order invoices' });
     }
 
+    // Draft cuando silent=true, Saved cuando silent=false
+    const invoiceStatus = silent ? 'Draft' : 'Saved';
+
     let totalAmount = 0;
     items.forEach(item => {
       const qty   = parseFloat(item.received_qty)  || 0;
@@ -240,7 +244,6 @@ const saveInvoice = async (req, res) => {
     let invoiceId;
 
     if (noOrder) {
-      // Si ya existe el invoice (edición), hacer UPDATE; si no, INSERT
       const existingInvoiceId = req.body.invoiceId ? parseInt(req.body.invoiceId) : null;
 
       if (existingInvoiceId) {
@@ -250,7 +253,7 @@ const saveInvoice = async (req, res) => {
           `UPDATE invoices
              SET id_vendor         = ?,
                  invoice_number    = ?,
-                 status            = 'Saved',
+                 status            = ?,
                  total_amount      = ?,
                  notes             = ?,
                  receipt_url       = COALESCE(?, receipt_url),
@@ -261,6 +264,7 @@ const saveInvoice = async (req, res) => {
           [
             vendorId,
             invoiceNumber   || null,
+            invoiceStatus,           // ← 'Draft' o 'Saved'
             totalAmount,
             notes           || null,
             receiptUrl      || null,
@@ -270,7 +274,6 @@ const saveInvoice = async (req, res) => {
             storeId
           ]
         );
-        // Borrar items anteriores para reinsertarlos actualizados
         await connection.execute('DELETE FROM invoice_items WHERE id_invoice = ?', [invoiceId]);
 
       } else {
@@ -279,11 +282,12 @@ const saveInvoice = async (req, res) => {
           `INSERT INTO invoices
              (id_order, id_store, id_vendor, invoice_number, status, total_amount,
               notes, created_by, receipt_url, receipt_public_id, no_order, invoice_date)
-           VALUES (NULL, ?, ?, ?, 'Saved', ?, ?, ?, ?, ?, 1, ?)`,
+           VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
           [
             storeId,
             vendorId,
             invoiceNumber   || null,
+            invoiceStatus,           // ← 'Draft' o 'Saved'
             totalAmount,
             notes           || null,
             createdBy       || null,
@@ -306,22 +310,40 @@ const saveInvoice = async (req, res) => {
         await connection.execute(
           `UPDATE invoices
              SET invoice_number    = ?,
-                 status            = 'Saved',
+                 status            = ?,
                  total_amount      = ?,
                  notes             = ?,
                  receipt_url       = COALESCE(?, receipt_url),
                  receipt_public_id = COALESCE(?, receipt_public_id),
                  updated_at        = NOW()
            WHERE id_invoice = ?`,
-          [invoiceNumber || null, totalAmount, notes || null, receiptUrl || null, receiptPublicId || null, invoiceId]
+          [
+            invoiceNumber || null,
+            invoiceStatus,           // ← 'Draft' o 'Saved'
+            totalAmount,
+            notes           || null,
+            receiptUrl      || null,
+            receiptPublicId || null,
+            invoiceId
+          ]
         );
         await connection.execute('DELETE FROM invoice_items WHERE id_invoice = ?', [invoiceId]);
       } else {
         const [result] = await connection.execute(
           `INSERT INTO invoices
              (id_order, id_store, invoice_number, status, total_amount, notes, created_by, receipt_url, receipt_public_id)
-           VALUES (?, ?, ?, 'Saved', ?, ?, ?, ?, ?)`,
-          [orderId, storeId, invoiceNumber || null, totalAmount, notes || null, createdBy || null, receiptUrl || null, receiptPublicId || null]
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            orderId,
+            storeId,
+            invoiceNumber   || null,
+            invoiceStatus,           // ← 'Draft' o 'Saved'
+            totalAmount,
+            notes           || null,
+            createdBy       || null,
+            receiptUrl      || null,
+            receiptPublicId || null
+          ]
         );
         invoiceId = result.insertId;
       }
@@ -389,7 +411,8 @@ const saveInvoice = async (req, res) => {
 
     await connection.commit();
 
-    const shouldSendEmail = noOrder || quantityDiscrepancies.length > 0;
+    // ── silent=true → no manda correo (invoice incompleto / draft) ──
+    const shouldSendEmail = !silent && (noOrder || quantityDiscrepancies.length > 0);
     let notificationSent  = false;
 
     if (shouldSendEmail) {
@@ -473,7 +496,7 @@ const saveInvoice = async (req, res) => {
 };
 
 // ============================================================
-// GET ALL INVOICES — ── FIX: usa invoice_date para no-order ──
+// GET ALL INVOICES
 // ============================================================
 const getAllInvoices = async (req, res) => {
   try {
@@ -624,8 +647,6 @@ const getVendorsForStore = async (req, res) => {
     const { storeId } = req.query;
     if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
 
-    // Traer todos los vendors — no solo los que tienen órdenes en esta tienda,
-    // para que no-order invoices pueda usarse con cualquier proveedor
     const [vendors] = await pool.execute(
       `SELECT
          v.id_vendors,
