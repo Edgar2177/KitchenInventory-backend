@@ -22,12 +22,7 @@ const checkDuplicateName = async (name, excludeId = null) => {
   return rows.length > 0;
 };
 
-// ============================================================
-// HELPER: calcula base_unit manejando correctamente el valor 0
-// ============================================================
 const safeConvertToBaseUnit = (value, unit) => {
-  // ← FIX: verifica explícitamente en vez de usar truthiness
-  // Esto evita que empty_weight = 0 sea tratado como "sin valor"
   if (value !== null && value !== undefined && value !== '' && unit) {
     return convertToBaseUnit(parseFloat(value), unit);
   }
@@ -49,6 +44,7 @@ const getAllProducts = async (req, res) => {
         p.id_category as categoryId,
         c.category_name as categoryName,
         p.container_type as containerType,
+        p.count_by as countBy,
         p.container_size as containerSize,
         p.container_unit as containerUnit,
         p.container_size_base_unit as containerSizeBaseUnit,
@@ -97,6 +93,7 @@ const getProductById = async (req, res) => {
         p.id_category as categoryId,
         c.category_name as categoryName,
         p.container_type as containerType,
+        p.count_by as countBy,
         p.container_size as containerSize,
         p.container_unit as containerUnit,
         p.container_size_base_unit as containerSizeBaseUnit,
@@ -139,33 +136,49 @@ const createProduct = async (req, res) => {
   try {
     const {
       name, productCode, productTypeId, categoryId,
-      containerType, containerSize, containerUnit,
+      containerType, countBy, containerSize, containerUnit,
       wholesalePrice, singlePortionSize, singlePortionUnit,
       fullWeight, fullWeightUnit, emptyWeight, emptyWeightUnit,
       caseSize, vendorId
     } = req.body;
 
     // Validaciones
-    if (!name || name.trim() === '') return res.status(400).json({ success: false, message: 'El nombre es requerido' });
-    if (!productTypeId)  return res.status(400).json({ success: false, message: 'El tipo de producto es requerido' });
-    if (!categoryId)     return res.status(400).json({ success: false, message: 'La categoría es requerida' });
-    if (!containerType)  return res.status(400).json({ success: false, message: 'El tipo de contenedor es requerido' });
-    if (!containerSize || containerSize <= 0) return res.status(400).json({ success: false, message: 'El tamaño del contenedor es requerido' });
-    if (!containerUnit)  return res.status(400).json({ success: false, message: 'La unidad del contenedor es requerida' });
+    if (!name || name.trim() === '')
+      return res.status(400).json({ success: false, message: 'El nombre es requerido' });
+    if (!productTypeId)
+      return res.status(400).json({ success: false, message: 'El tipo de producto es requerido' });
+    if (!categoryId)
+      return res.status(400).json({ success: false, message: 'La categoría es requerida' });
+    if (!containerType)
+      return res.status(400).json({ success: false, message: 'El tipo de contenedor es requerido' });
+    if (!containerSize || containerSize <= 0)
+      return res.status(400).json({ success: false, message: 'El tamaño del contenedor es requerido' });
+    if (!containerUnit)
+      return res.status(400).json({ success: false, message: 'La unidad del contenedor es requerida' });
 
     const normalizedName = name.trim();
     const isDuplicate = await checkDuplicateName(normalizedName);
-    if (isDuplicate) return res.status(409).json({ success: false, message: 'Ya existe un producto con ese nombre' });
+    if (isDuplicate)
+      return res.status(409).json({ success: false, message: 'Ya existe un producto con ese nombre' });
 
-    const [productType] = await pool.execute('SELECT id_product_types FROM product_types WHERE id_product_types = ?', [productTypeId]);
-    if (productType.length === 0) return res.status(404).json({ success: false, message: 'El tipo de producto no existe' });
+    const [productType] = await pool.execute(
+      'SELECT id_product_types FROM product_types WHERE id_product_types = ?', [productTypeId]
+    );
+    if (productType.length === 0)
+      return res.status(404).json({ success: false, message: 'El tipo de producto no existe' });
 
-    const [category] = await pool.execute('SELECT id_categories FROM categories WHERE id_categories = ?', [categoryId]);
-    if (category.length === 0) return res.status(404).json({ success: false, message: 'La categoría no existe' });
+    const [category] = await pool.execute(
+      'SELECT id_categories FROM categories WHERE id_categories = ?', [categoryId]
+    );
+    if (category.length === 0)
+      return res.status(404).json({ success: false, message: 'La categoría no existe' });
 
     if (vendorId) {
-      const [vendor] = await pool.execute('SELECT id_vendors FROM vendors WHERE id_vendors = ?', [vendorId]);
-      if (vendor.length === 0) return res.status(404).json({ success: false, message: 'El proveedor no existe' });
+      const [vendor] = await pool.execute(
+        'SELECT id_vendors FROM vendors WHERE id_vendors = ?', [vendorId]
+      );
+      if (vendor.length === 0)
+        return res.status(404).json({ success: false, message: 'El proveedor no existe' });
     }
 
     const containerSizeBaseUnit     = convertToBaseUnit(containerSize, containerUnit);
@@ -179,35 +192,35 @@ const createProduct = async (req, res) => {
     const fullWeightBaseUnitType = (fullWeight !== null && fullWeight !== undefined && fullWeight !== '' && fullWeightUnit)
       ? getBaseUnitLabel(fullWeightUnit) : null;
 
-    // ← FIX: usa safeConvertToBaseUnit para manejar empty_weight = 0
     const emptyWeightBaseUnit     = safeConvertToBaseUnit(emptyWeight, emptyWeightUnit);
     const emptyWeightBaseUnitType = (emptyWeight !== null && emptyWeight !== undefined && emptyWeight !== '' && emptyWeightUnit)
       ? getBaseUnitLabel(emptyWeightUnit) : null;
 
     const [result] = await pool.execute(
       `INSERT INTO products (
-        product_name, product_code, id_product_type, id_category, 
-        container_type, container_size, container_unit, 
+        product_name, product_code, id_product_type, id_category,
+        container_type, count_by,
+        container_size, container_unit,
         container_size_base_unit, container_size_base_unit_type,
-        wholesale_price, 
-        single_portion_size, single_portion_unit, 
+        wholesale_price,
+        single_portion_size, single_portion_unit,
         single_portion_base_unit, single_portion_base_unit_type,
-        full_weight, full_weight_unit, 
+        full_weight, full_weight_unit,
         full_weight_base_unit, full_weight_base_unit_type,
-        empty_weight, empty_weight_unit, 
+        empty_weight, empty_weight_unit,
         empty_weight_base_unit, empty_weight_base_unit_type,
         case_size, id_vendor
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         normalizedName, productCode || null, productTypeId, categoryId,
-        containerType, containerSize, containerUnit,
+        containerType, countBy || null,
+        containerSize, containerUnit,
         containerSizeBaseUnit, containerSizeBaseUnitType,
         wholesalePrice || null,
         singlePortionSize || null, singlePortionUnit || null,
         singlePortionBaseUnit, singlePortionBaseUnitType,
         fullWeight || null, fullWeightUnit || null,
         fullWeightBaseUnit, fullWeightBaseUnitType,
-        // ← emptyWeight: guarda 0 si es 0, null si es vacío
         (emptyWeight !== undefined && emptyWeight !== null && emptyWeight !== '') ? parseFloat(emptyWeight) : null,
         emptyWeightUnit || null,
         emptyWeightBaseUnit, emptyWeightBaseUnitType,
@@ -215,7 +228,11 @@ const createProduct = async (req, res) => {
       ]
     );
 
-    res.status(201).json({ success: true, message: 'Producto creado exitosamente', data: { id: result.insertId, name: normalizedName } });
+    res.status(201).json({
+      success: true,
+      message: 'Producto creado exitosamente',
+      data: { id: result.insertId, name: normalizedName }
+    });
   } catch (error) {
     console.error('Error al crear producto:', error);
     res.status(500).json({ success: false, message: 'Error al crear el producto', error: error.message });
@@ -230,33 +247,49 @@ const updateProduct = async (req, res) => {
     const { id } = req.params;
     const {
       name, productCode, productTypeId, categoryId,
-      containerType, containerSize, containerUnit,
+      containerType, countBy, containerSize, containerUnit,
       wholesalePrice, singlePortionSize, singlePortionUnit,
       fullWeight, fullWeightUnit, emptyWeight, emptyWeightUnit,
       caseSize, vendorId
     } = req.body;
 
     // Validaciones
-    if (!name || name.trim() === '') return res.status(400).json({ success: false, message: 'El nombre es requerido' });
-    if (!productTypeId)  return res.status(400).json({ success: false, message: 'El tipo de producto es requerido' });
-    if (!categoryId)     return res.status(400).json({ success: false, message: 'La categoría es requerida' });
-    if (!containerType)  return res.status(400).json({ success: false, message: 'El tipo de contenedor es requerido' });
-    if (!containerSize || containerSize <= 0) return res.status(400).json({ success: false, message: 'El tamaño del contenedor es requerido' });
-    if (!containerUnit)  return res.status(400).json({ success: false, message: 'La unidad del contenedor es requerida' });
+    if (!name || name.trim() === '')
+      return res.status(400).json({ success: false, message: 'El nombre es requerido' });
+    if (!productTypeId)
+      return res.status(400).json({ success: false, message: 'El tipo de producto es requerido' });
+    if (!categoryId)
+      return res.status(400).json({ success: false, message: 'La categoría es requerida' });
+    if (!containerType)
+      return res.status(400).json({ success: false, message: 'El tipo de contenedor es requerido' });
+    if (!containerSize || containerSize <= 0)
+      return res.status(400).json({ success: false, message: 'El tamaño del contenedor es requerido' });
+    if (!containerUnit)
+      return res.status(400).json({ success: false, message: 'La unidad del contenedor es requerida' });
 
     const normalizedName = name.trim();
     const isDuplicate = await checkDuplicateName(normalizedName, id);
-    if (isDuplicate) return res.status(409).json({ success: false, message: 'Ya existe un producto con ese nombre' });
+    if (isDuplicate)
+      return res.status(409).json({ success: false, message: 'Ya existe un producto con ese nombre' });
 
-    const [productType] = await pool.execute('SELECT id_product_types FROM product_types WHERE id_product_types = ?', [productTypeId]);
-    if (productType.length === 0) return res.status(404).json({ success: false, message: 'El tipo de producto no existe' });
+    const [productType] = await pool.execute(
+      'SELECT id_product_types FROM product_types WHERE id_product_types = ?', [productTypeId]
+    );
+    if (productType.length === 0)
+      return res.status(404).json({ success: false, message: 'El tipo de producto no existe' });
 
-    const [category] = await pool.execute('SELECT id_categories FROM categories WHERE id_categories = ?', [categoryId]);
-    if (category.length === 0) return res.status(404).json({ success: false, message: 'La categoría no existe' });
+    const [category] = await pool.execute(
+      'SELECT id_categories FROM categories WHERE id_categories = ?', [categoryId]
+    );
+    if (category.length === 0)
+      return res.status(404).json({ success: false, message: 'La categoría no existe' });
 
     if (vendorId) {
-      const [vendor] = await pool.execute('SELECT id_vendors FROM vendors WHERE id_vendors = ?', [vendorId]);
-      if (vendor.length === 0) return res.status(404).json({ success: false, message: 'El proveedor no existe' });
+      const [vendor] = await pool.execute(
+        'SELECT id_vendors FROM vendors WHERE id_vendors = ?', [vendorId]
+      );
+      if (vendor.length === 0)
+        return res.status(404).json({ success: false, message: 'El proveedor no existe' });
     }
 
     const containerSizeBaseUnit     = convertToBaseUnit(containerSize, containerUnit);
@@ -270,35 +303,35 @@ const updateProduct = async (req, res) => {
     const fullWeightBaseUnitType = (fullWeight !== null && fullWeight !== undefined && fullWeight !== '' && fullWeightUnit)
       ? getBaseUnitLabel(fullWeightUnit) : null;
 
-    // ← FIX: usa safeConvertToBaseUnit para manejar empty_weight = 0
     const emptyWeightBaseUnit     = safeConvertToBaseUnit(emptyWeight, emptyWeightUnit);
     const emptyWeightBaseUnitType = (emptyWeight !== null && emptyWeight !== undefined && emptyWeight !== '' && emptyWeightUnit)
       ? getBaseUnitLabel(emptyWeightUnit) : null;
 
     const [result] = await pool.execute(
-      `UPDATE products SET 
+      `UPDATE products SET
         product_name = ?, product_code = ?, id_product_type = ?, id_category = ?,
-        container_type = ?, container_size = ?, container_unit = ?, 
+        container_type = ?, count_by = ?,
+        container_size = ?, container_unit = ?,
         container_size_base_unit = ?, container_size_base_unit_type = ?,
-        wholesale_price = ?, 
-        single_portion_size = ?, single_portion_unit = ?, 
+        wholesale_price = ?,
+        single_portion_size = ?, single_portion_unit = ?,
         single_portion_base_unit = ?, single_portion_base_unit_type = ?,
-        full_weight = ?, full_weight_unit = ?, 
+        full_weight = ?, full_weight_unit = ?,
         full_weight_base_unit = ?, full_weight_base_unit_type = ?,
-        empty_weight = ?, empty_weight_unit = ?, 
+        empty_weight = ?, empty_weight_unit = ?,
         empty_weight_base_unit = ?, empty_weight_base_unit_type = ?,
         case_size = ?, id_vendor = ?
       WHERE id_products = ?`,
       [
         normalizedName, productCode || null, productTypeId, categoryId,
-        containerType, containerSize, containerUnit,
+        containerType, countBy || null,
+        containerSize, containerUnit,
         containerSizeBaseUnit, containerSizeBaseUnitType,
         wholesalePrice || null,
         singlePortionSize || null, singlePortionUnit || null,
         singlePortionBaseUnit, singlePortionBaseUnitType,
         fullWeight || null, fullWeightUnit || null,
         fullWeightBaseUnit, fullWeightBaseUnitType,
-        // ← emptyWeight: guarda 0 si es 0, null si es vacío
         (emptyWeight !== undefined && emptyWeight !== null && emptyWeight !== '') ? parseFloat(emptyWeight) : null,
         emptyWeightUnit || null,
         emptyWeightBaseUnit, emptyWeightBaseUnitType,
@@ -325,7 +358,8 @@ const deleteProduct = async (req, res) => {
   try {
     const { id } = req.params;
     const [result] = await pool.execute('DELETE FROM products WHERE id_products = ?', [id]);
-    if (result.affectedRows === 0) return res.status(404).json({ success: false, message: 'Producto no encontrado' });
+    if (result.affectedRows === 0)
+      return res.status(404).json({ success: false, message: 'Producto no encontrado' });
     res.json({ success: true, message: 'Producto eliminado exitosamente' });
   } catch (error) {
     console.error('Error al eliminar producto:', error);
@@ -340,22 +374,23 @@ const exportProductsToCSV = async (req, res) => {
   try {
     const query = `
       SELECT 
-        p.product_name as 'Product Name',
-        p.product_code as 'Product Code',
-        pt.product_name as 'Product Type',
-        c.category_name as 'Category',
-        p.container_type as 'Container Type',
-        p.container_size as 'Container Size',
-        p.container_unit as 'Container Unit',
-        p.wholesale_price as 'Wholesale Price',
+        p.product_name      as 'Product Name',
+        p.product_code      as 'Product Code',
+        pt.product_name     as 'Product Type',
+        c.category_name     as 'Category',
+        p.container_type    as 'Container Type',
+        p.count_by          as 'Count By',
+        p.container_size    as 'Container Size',
+        p.container_unit    as 'Container Unit',
+        p.wholesale_price   as 'Wholesale Price',
         p.single_portion_size as 'Single Portion Size',
         p.single_portion_unit as 'Single Portion Unit',
-        p.full_weight as 'Full Weight',
-        p.full_weight_unit as 'Full Weight Unit',
-        p.empty_weight as 'Empty Weight',
+        p.full_weight       as 'Full Weight',
+        p.full_weight_unit  as 'Full Weight Unit',
+        p.empty_weight      as 'Empty Weight',
         p.empty_weight_unit as 'Empty Weight Unit',
-        p.case_size as 'Case Size',
-        v.vendor_name as 'Vendor'
+        p.case_size         as 'Case Size',
+        v.vendor_name       as 'Vendor'
       FROM products p
       INNER JOIN product_types pt ON p.id_product_type = pt.id_product_types
       INNER JOIN categories c ON p.id_category = c.id_categories

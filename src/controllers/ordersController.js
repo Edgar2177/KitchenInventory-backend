@@ -304,7 +304,7 @@ const calculateOrderSuggestions = async (req, res) => {
 
       // ── Purchase ────────────────────────────────────────────────────────────
       const purchaseRaw = purchaseByProduct[product.id_products] || 0;
-      const purchase = purchaseRaw;
+      const purchase = isOrderByCase ? purchaseRaw / caseSize : purchaseRaw;
 
       // ── Sold ────────────────────────────────────────────────────────────────
       const sold = 0;

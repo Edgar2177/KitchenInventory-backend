@@ -35,9 +35,7 @@ const getLastInventoryOrder = async (locationId) => {
   return result;
 };
 
-// ── FIX 1: usa full_weight_base_unit y empty_weight_base_unit (ya en gramos) ──
 const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmptyWeight) => {
-  // Siempre tomar los valores base (gramos) desde la tabla products
   const [product] = await connection.execute(
     `SELECT full_weight_base_unit as full_weight,
             empty_weight_base_unit as empty_weight
@@ -53,8 +51,6 @@ const calculateNetWeight = async (connection, productId, itemFullWeight, itemEmp
     emptyWeight = product[0].empty_weight != null ? parseFloat(product[0].empty_weight) : null;
   }
 
-  // Fallback: si el producto no tiene base_unit guardado, usar los valores del item
-  // (esto cubre productos viejos que aún no tienen base_unit calculado)
   if (fullWeight === null && itemFullWeight) {
     fullWeight = parseFloat(itemFullWeight) || null;
   }
@@ -97,7 +93,6 @@ const calcProductWeight = (quantity, quantityType, fullWeight, emptyWeight, netW
     const netVal     = parseFloat(netWeight) || 0;
     const fullVal    = parseFloat(fullWeight) || 0;
 
-    // fullWeight, emptyWeight y netWeight ya están en gramos (base_unit)
     if (netVal > 0 && fullVal > 0 && emptyVal > 0) {
       const productWeightGrams = qtyInGrams - emptyVal;
       return {
@@ -222,7 +217,7 @@ const getInventoryById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Inventory not found' });
     }
 
-    // ── FIX 4: usa full_weight_base_unit (gramos) como product_full_weight ──
+    // ✅ Agrega category_name y product_type_name para Group By
     const [items] = await pool.execute(
       `SELECT 
         ii.*,
@@ -235,9 +230,13 @@ const getInventoryById = async (req, res) => {
         p.full_weight_base_unit  as product_full_weight,
         p.empty_weight_base_unit as product_empty_weight,
         p.wholesale_price,
-        l.location_name
+        l.location_name,
+        c.category_name,
+        pt.product_name AS product_type_name
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
+       LEFT JOIN categories c ON p.id_category = c.id_categories
+       LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
        LEFT JOIN locations l ON ii.id_location = l.id_locations
        WHERE ii.id_inventory = ? AND ii.item_type = 'product'
        ORDER BY ii.display_order ASC, p.product_name`,
@@ -283,7 +282,7 @@ const getAvailableProducts = async (req, res) => {
       return res.status(400).json({ success: false, message: 'storeId es requerido' });
     }
 
-    // ── FIX 2: usa full_weight_base_unit y empty_weight_base_unit (ya en gramos) ──
+    // ✅ Agrega category_name y product_type_name para Group By
     const [products] = await pool.execute(
       `SELECT 
         p.id_products as id,
@@ -301,9 +300,13 @@ const getAvailableProducts = async (req, res) => {
         p.full_weight_unit as weight_unit,
         pbs.par,
         pbs.reorder_point,
-        pbs.order_by_the
+        pbs.order_by_the,
+        c.category_name,
+        pt.product_name AS product_type_name
        FROM products p
        INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+       LEFT JOIN categories c ON p.id_category = c.id_categories
+       LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
        WHERE pbs.id_store = ?
        ORDER BY p.product_name`,
       [storeId]
@@ -421,7 +424,6 @@ const createInventory = async (req, res) => {
         return res.status(400).json({ success: false, message: `Invalid quantity for product: ${item.productName}` });
       }
       const wsValue = parseFloat(item.wholesaleValue) || 0;
-      // calculateNetWeight ahora usa full_weight_base_unit (gramos) internamente
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
       const pw      = calcProductWeight(quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
@@ -567,7 +569,6 @@ const updateInventory = async (req, res) => {
 
       for (const item of (items || [])) {
         const wsValue = parseFloat(item.wholesaleValue) || 0;
-        // calculateNetWeight ahora usa full_weight_base_unit (gramos) internamente
         const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
         const pw      = calcProductWeight(parseFloat(item.quantity), item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
@@ -709,7 +710,7 @@ const getLastInventoryProducts = async (req, res) => {
 
     const lastInventoryId = lastInventory[0].id_inventories;
 
-    // ── FIX 3: usa full_weight_base_unit y empty_weight_base_unit (ya en gramos) ──
+    // ✅ Agrega category_name y product_type_name para Group By
     const [items] = await pool.execute(
       `SELECT 
         ii.display_order, ii.quantity_type, ii.full_weight, ii.empty_weight, ii.net_weight,
@@ -718,9 +719,13 @@ const getLastInventoryProducts = async (req, res) => {
         p.container_unit as containerUnit, p.case_size as caseSize,
         p.full_weight_base_unit  as product_full_weight,
         p.empty_weight_base_unit as product_empty_weight,
-        p.wholesale_price as wholesalePrice
+        p.wholesale_price as wholesalePrice,
+        c.category_name,
+        pt.product_name AS product_type_name
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
+       LEFT JOIN categories c ON p.id_category = c.id_categories
+       LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
        WHERE ii.id_inventory = ? AND ii.item_type = 'product'
        ORDER BY ii.display_order ASC`,
       [lastInventoryId]
@@ -784,7 +789,6 @@ const importInventoryFromExcel = async (req, res) => {
         let productRow = null;
 
         if (productCode) {
-          // ── usa full_weight_base_unit y empty_weight_base_unit (gramos) ──
           const [byCode] = await connection.execute(
             `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
                p.full_weight_base_unit  as full_weight,
@@ -830,7 +834,6 @@ const importInventoryFromExcel = async (req, res) => {
           if (containerTypes.includes(weightType)) {
             wholesaleValue = quantity * unitPrice;
           } else if (productRow.full_weight && productRow.empty_weight !== null) {
-            // full_weight y empty_weight ya están en gramos (base_unit)
             const full  = parseFloat(productRow.full_weight);
             const empty = parseFloat(productRow.empty_weight);
             if (full > empty) {
@@ -868,7 +871,6 @@ const importInventoryFromExcel = async (req, res) => {
 
     let totalWsValue = 0;
     for (const item of items) {
-      // calculateNetWeight ya usa base_unit internamente
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
       const pw      = calcProductWeight(item.quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
 
@@ -905,7 +907,7 @@ const importInventoryFromExcel = async (req, res) => {
 };
 
 // ========================================
-// GET PRODUCTS FOR PRINT — incluye preps
+// GET PRODUCTS FOR PRINT — incluye preps y product_type_name
 // ========================================
 const getProductsForPrintInventory = async (req, res) => {
   try {
@@ -925,7 +927,7 @@ const getProductsForPrintInventory = async (req, res) => {
       return res.json({ success: true, data: [], message: 'No locked inventory found for this location' });
     }
 
-    // full_weight y empty_weight en inventory_items ya están en gramos (guardados desde base_unit)
+    // ✅ Agrega product_type_name para Group By
     const [productItems] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -935,6 +937,7 @@ const getProductsForPrintInventory = async (req, res) => {
         p.container_unit,
         p.container_type,
         c.category_name,
+        pt.product_name AS product_type_name,
         'product' as item_type,
         ROUND(SUM(
           CASE
@@ -956,6 +959,7 @@ const getProductsForPrintInventory = async (req, res) => {
        FROM inventory_items ii
        INNER JOIN products p ON ii.id_product = p.id_products
        INNER JOIN categories c ON p.id_category = c.id_categories
+       LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
        WHERE ii.id_inventory = ? AND ii.item_type = 'product'
        GROUP BY p.id_products
        ORDER BY c.category_name ASC, p.product_name ASC`,
@@ -969,6 +973,7 @@ const getProductsForPrintInventory = async (req, res) => {
         pr.yield_unit as container_unit,
         'prep' as item_type,
         'Pre-Batch' as category_name,
+        'Pre-Batch' as product_type_name,
         pr.yield_unit as quantity_type,
         SUM(ii.quantity) as last_inv_quantity
        FROM inventory_items ii

@@ -86,6 +86,7 @@ const getPhysicalInventoryById = async (req, res) => {
         p.container_unit,
         p.container_type,
         p.wholesale_price,
+        p.count_by,
         c.category_name,
         pt.product_name AS product_type_name
        FROM products p
@@ -134,6 +135,19 @@ const getPhysicalInventoryById = async (req, res) => {
     const savedPrepMap = {};
     savedPrepItems.forEach(item => { savedPrepMap[item.id_prep] = item.inv_quantity; });
 
+    const [[prevInvRow]] = await pool.execute(
+      `SELECT DATE(i2.inventory_date) as inv_date
+       FROM inventories i2
+       WHERE i2.id_store = ?
+         AND i2.status = 'Locked'
+         AND DATE(i2.inventory_date) < DATE(?)
+         AND i2.id_inventories != ?
+       ORDER BY i2.inventory_date DESC
+       LIMIT 1`,
+      [storeId, inventoryDate, id]
+    );
+    const prevInvDate = prevInvRow?.inv_date || null;
+
     // 5. Last Inv = SUMA del día más reciente ANTERIOR a este inventario (solo productos)
     const [lastInvData] = await pool.execute(
       `SELECT 
@@ -169,6 +183,32 @@ const getPhysicalInventoryById = async (req, res) => {
       [storeId, storeId, inventoryDate, id]
     );
 
+    const purchaseMap = {};
+      if (prevInvDate) {
+        try {
+          const [purchases] = await pool.execute(
+            `SELECT 
+               ii.id_product,
+               SUM(ii.received_qty) as total_qty
+             FROM invoice_items ii
+             INNER JOIN invoices inv ON ii.id_invoice = inv.id_invoice
+             LEFT JOIN orders o ON inv.id_order = o.id_orders
+             WHERE inv.id_store = ?
+               AND inv.status = 'Saved'
+               AND ii.received_qty IS NOT NULL
+               AND DATE(COALESCE(inv.invoice_date, o.sent_at, inv.created_at)) >= ?
+               AND DATE(COALESCE(inv.invoice_date, o.sent_at, inv.created_at)) < ?
+             GROUP BY ii.id_product`,
+            [storeId, prevInvDate, inventoryDate]
+          );
+          purchases.forEach(p => {
+            purchaseMap[p.id_product] = parseFloat(p.total_qty) || 0;
+          });
+        } catch (e) {
+          console.warn('⚠️ Error fetching purchases for physical inventory:', e.message);
+        }
+      }
+
     const lastInvMap = {};
     lastInvData.forEach(item => { lastInvMap[item.id_product] = parseFloat(item.last_quantity) || 0; });
 
@@ -185,6 +225,8 @@ const getPhysicalInventoryById = async (req, res) => {
       container_size:    p.container_size  || null,
       container_unit:    p.container_unit  || '',
       container_type:    p.container_type  || '',
+      count_by:          p.count_by       || '',
+      purchase: purchaseMap[p.id_products] ?? 0,
       last_inv_quantity: lastInvMap[p.id_products] ?? 0,
       inv_quantity:      savedMap[p.id_products]   ?? null,
       display_order:     i + 1
@@ -234,6 +276,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
         p.container_type,
         c.category_name,
         c.id_categories,
+        p.count_by,
         pt.product_name AS product_type_name,
         'product' as item_type
        FROM products p
@@ -244,6 +287,43 @@ const getProductsForPhysicalInventory = async (req, res) => {
        ORDER BY pt.product_name ASC, c.category_name ASC, p.product_name ASC`,
       [storeId]
     );
+
+    const [[lastInvRow]] = await pool.execute(
+      `SELECT DATE(inventory_date) as inv_date
+       FROM inventories
+       WHERE id_store = ? AND status = 'Locked'
+       ORDER BY inventory_date DESC
+       LIMIT 1`,
+      [storeId]
+    );
+    const prevInvDate = lastInvRow?.inv_date || null;
+    const today = new Date().toISOString().split('T')[0];
+
+    const purchaseMap = {};
+      if (prevInvDate) {
+        try {
+          const [purchases] = await pool.execute(
+            `SELECT 
+               ii.id_product,
+               SUM(ii.received_qty) as total_qty
+             FROM invoice_items ii
+             INNER JOIN invoices inv ON ii.id_invoice = inv.id_invoice
+             LEFT JOIN orders o ON inv.id_order = o.id_orders
+             WHERE inv.id_store = ?
+               AND inv.status = 'Saved'
+               AND ii.received_qty IS NOT NULL
+               AND DATE(COALESCE(inv.invoice_date, o.sent_at, inv.created_at)) >= ?
+               AND DATE(COALESCE(inv.invoice_date, o.sent_at, inv.created_at)) <= ?
+             GROUP BY ii.id_product`,
+            [storeId, prevInvDate, today]
+          );
+          purchases.forEach(p => {
+            purchaseMap[p.id_product] = parseFloat(p.total_qty) || 0;
+          });
+        } catch (e) {
+          console.warn('⚠️ Error fetching purchases:', e.message);
+        }
+      }
 
     // Todos los preps del store
     const [preps] = await pool.execute(
@@ -307,7 +387,8 @@ const getProductsForPhysicalInventory = async (req, res) => {
       ...p,
       id_preps:          null,
       product_type_name: p.product_type_name || 'Other',
-      last_inv_quantity: lastInvMap[p.id_products] ?? 0
+      last_inv_quantity: lastInvMap[p.id_products] ?? 0,
+      purchase:          purchaseMap[p.id_products] ?? 0   
     }));
 
     const prepResults = preps.map(p => ({
