@@ -9,24 +9,23 @@ const {
   sendOrderEmail,
   getOrderDates,      
   getOrdersForView,
+  getProductsForManualOrder,
   deleteOrder
 } = require('../controllers/ordersController');
 
-// GET inventories for selector
 router.get('/inventories', getInventoriesForOrdering);
-
-// POST calculate order suggestions based on inventory
 router.post('/calculate', calculateOrderSuggestions);
-
 router.get('/view/dates', getOrderDates);
 router.get('/view', getOrdersForView);
 
-// CRUD orders
+// ✅ Rutas específicas SIEMPRE antes de /:id
+router.get('/manual-products', getProductsForManualOrder);
+
+// Rutas dinámicas al final
 router.get('/', getAllOrders);
 router.get('/:id', getOrderById);
 router.post('/', createOrder);
 router.delete('/:id', deleteOrder);
-// Send order email to vendor
 router.post('/:id/send-email', sendOrderEmail);
 
 module.exports = router;

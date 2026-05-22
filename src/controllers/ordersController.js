@@ -682,6 +682,83 @@ const deleteOrder = async (req, res) => {
   }
 };
 
+// ============================================
+// GET PRODUCTS FOR MANUAL ORDER
+// ============================================
+const getProductsForManualOrder = async (req, res) => {
+  try {
+    const { storeId } = req.query;
+    if (!storeId) return res.status(400).json({ message: 'storeId is required' });
+
+    const [products] = await pool.execute(
+      `SELECT
+        p.id_products     AS id,
+        p.product_name    AS name,
+        p.product_code,
+        p.container_type,
+        p.container_size,
+        p.container_unit,
+        p.case_size,
+        p.wholesale_price,
+        pbs.order_by_the  AS order_by,
+        v.id_vendors      AS vendor_id,
+        v.vendor_name,
+        v.email           AS vendor_email
+       FROM products p
+       INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+       LEFT JOIN vendors v ON p.id_vendor = v.id_vendors
+       WHERE pbs.id_store = ?
+       ORDER BY v.vendor_name, p.product_name`,
+      [storeId]
+    );
+
+    res.json({ success: true, data: products });
+  } catch (error) {
+    console.error('Error fetching products for manual order:', error);
+    res.status(500).json({ message: 'Error fetching products', error: error.message });
+  }
+};
+
+const getProductsByStoreId = async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const query = `
+      SELECT 
+        ps.id_product_store as id,
+        ps.id_product as productId,
+        p.product_name as productName,
+        p.product_code as productCode,
+        p.container_size as containerSize,
+        p.container_unit as containerUnit,
+        p.container_type as containerType,
+        p.case_size as caseSize,
+        p.wholesale_price as wholesalePrice,
+        p.full_weight_base_unit as fullWeightBaseUnit,
+        p.empty_weight_base_unit as emptyWeightBaseUnit,
+        c.category_name as categoryName,
+        pt.product_name AS productTypeName,
+        ps.par as par,
+        ps.reorder_point as reorderPoint,
+        ps.order_by_the as orderByThe,
+        v.id_vendors as vendorId,
+        v.vendor_name as vendorName,
+        v.email as vendorEmail
+      FROM products_by_store ps
+      INNER JOIN products p ON ps.id_product = p.id_products
+      LEFT JOIN categories c ON p.id_category = c.id_categories
+      LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
+      LEFT JOIN vendors v ON p.id_vendor = v.id_vendors
+      WHERE ps.id_store = ?
+      ORDER BY pt.product_name, c.category_name, p.product_name
+    `;
+    const [rows] = await pool.execute(query, [storeId]);
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('Error al obtener productos de la tienda:', error);
+    res.status(500).json({ success: false, message: 'Error al obtener los productos de la tienda', error: error.message });
+  }
+};
+
 module.exports = {
   getInventoriesForOrdering,
   calculateOrderSuggestions,
@@ -691,5 +768,7 @@ module.exports = {
   sendOrderEmail,
   getOrderDates,
   getOrdersForView,
+  getProductsForManualOrder,
+  getProductsByStoreId,
   deleteOrder
 };

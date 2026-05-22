@@ -270,11 +270,69 @@ const importProductsByStore = async (req, res) => {
   }
 };
 
+// ========================================
+// EXPORTAR PRODUCTOS DE TIENDA A EXCEL
+// ========================================
+const exportProductsByStore = async (req, res) => {
+  try {
+    const { storeId } = req.query;
+    if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
+
+    const [rows] = await pool.execute(
+      `SELECT
+        p.product_name        AS 'Product Name',
+        p.product_code        AS 'Product Code',
+        pt.product_name       AS 'Product Type',
+        c.category_name       AS 'Category',
+        p.container_type      AS 'Container Type',
+        p.container_size      AS 'Container Size',
+        p.container_unit      AS 'Container Unit',
+        ps.par                AS 'Par',
+        ps.reorder_point      AS 'Reorder Point',
+        ps.order_by_the       AS 'Order By'
+       FROM products_by_store ps
+       INNER JOIN products p     ON ps.id_product    = p.id_products
+       LEFT JOIN categories c    ON p.id_category    = c.id_categories
+       LEFT JOIN product_types pt ON p.id_product_type = pt.id_product_types
+       WHERE ps.id_store = ?
+       ORDER BY pt.product_name, c.category_name, p.product_name`,
+      [storeId]
+    );
+
+    const workbook  = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+
+    worksheet['!cols'] = [
+      { wch: 35 }, // Product Name
+      { wch: 15 }, // Product Code
+      { wch: 20 }, // Product Type
+      { wch: 20 }, // Category
+      { wch: 15 }, // Container Type
+      { wch: 13 }, // Container Size
+      { wch: 13 }, // Container Unit
+      { wch: 8  }, // Par
+      { wch: 14 }, // Reorder Point
+      { wch: 12 }, // Order By
+    ];
+
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Products');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+    res.setHeader('Content-Disposition', `attachment; filename="products_store_${storeId}.xlsx"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ success: false, message: 'Error exporting products', error: error.message });
+  }
+};
+
 module.exports = {
   getAllProductsByStore,
   getProductsByStoreId,
   assignProductToStore,
   updateProductInStore,
   removeProductFromStore,
+  exportProductsByStore,
   importProductsByStore
 };

@@ -168,6 +168,22 @@ const getOrCreateFromExcelLocation = async (storeId) => {
 // CONTROLADORES
 // ========================================
 
+// ========================================
+// HELPER: Lectura de columnas flexible (case-insensitive)
+// ========================================
+const getRowValue = (row, ...names) => {
+  for (const name of names) {
+    const normalized = name.toLowerCase().trim();
+    for (const key of Object.keys(row)) {
+      if (key.toLowerCase().trim() === normalized) {
+        const val = row[key];
+        return (val !== null && val !== undefined) ? String(val).trim() : null;
+      }
+    }
+  }
+  return null;
+};
+
 const getAllInventories = async (req, res) => {
   try {
     const { storeId } = req.query;
@@ -766,100 +782,188 @@ const importInventoryFromExcel = async (req, res) => {
     const locationId = await getOrCreateFromExcelLocation(storeId);
     const workbook   = XLSX.read(req.file.buffer, { type: 'buffer' });
     const worksheet  = workbook.Sheets[workbook.SheetNames[0]];
-    const data       = XLSX.utils.sheet_to_json(worksheet, { defval: null });
-    const date       = inventoryDate || new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+    // ✅ Detectar automáticamente si el archivo tiene headers o no
+    const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null });
+
+    if (rawRows.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({ success: false, message: 'The file is empty' });
+    }
+
+    const KNOWN_HEADERS = [
+      'product name', 'name', 'product code', 'code', 'sku',
+      'closing inv', 'quantity', 'qty', 'inv', 'count',
+      'container type', 'type', 'item type'
+    ];
+
+    const firstRow   = rawRows[0].map(c => (c ? String(c).toLowerCase().trim() : ''));
+    const hasHeaders = firstRow.some(cell => KNOWN_HEADERS.includes(cell));
+
+    const data = hasHeaders
+      ? XLSX.utils.sheet_to_json(worksheet, { defval: null })
+      : rawRows.map(row => ({
+          'Product Name':   row[0] != null ? String(row[0]).trim() : null,
+          'Closing Inv':    row[1],
+          'Container Type': row[2] != null ? String(row[2]).trim() : null,
+          'Type':           row[3] != null ? String(row[3]).trim() : null,
+        }));
+
+    const date = inventoryDate || new Date().toISOString().slice(0, 19).replace('T', ' ');
 
     let imported = 0, skipped = 0;
-    const errors = [], items = [];
+    const errors = [], items = [], prepItemsToInsert = [];
 
     for (let i = 0; i < data.length; i++) {
       const row    = data[i];
       const rowNum = i + 2;
 
-      const productCode        = row['Product Code'] ? String(row['Product Code']).trim() : null;
-      const productName        = row['Product Name'] ? String(row['Product Name']).trim() : null;
-      const containerTypeExcel = row['Container Type'] ? String(row['Container Type']).trim() : null;
+      // Detectar si la fila es prep o producto
+      const rawType = getRowValue(row, 'type', 'item type', 'item_type');
+      const isPrep  = rawType && ['prep', 'pre-batch', 'prebatch', 'pre batch'].includes(rawType.toLowerCase());
 
-      if (!productCode && !productName) { skipped++; continue; }
-
-      const quantity = parseFloat(row['Closing Inv']) || 0;
-      if (isNaN(quantity)) { skipped++; continue; }
+      // Cantidad con nombres de columna flexibles
+      const rawQuantity = getRowValue(row,
+        'closing inv', 'closing inventory', 'quantity', 'qty',
+        'inv', 'count', 'inventory', 'cantidad'
+      );
+      const quantity = parseFloat(rawQuantity) || 0;
 
       try {
-        let productRow = null;
-
-        if (productCode) {
-          const [byCode] = await connection.execute(
-            `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
-               p.full_weight_base_unit  as full_weight,
-               p.empty_weight_base_unit as empty_weight,
-               p.wholesale_price, p.case_size, p.container_size, p.container_unit
-             FROM products p
-             INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
-             WHERE LOWER(TRIM(p.product_code)) = LOWER(TRIM(?)) AND pbs.id_store = ?`,
-            [productCode, storeId]
+        // ================================
+        // CASO: PRE-BATCH / PREP
+        // ================================
+        if (isPrep) {
+          const prepName = getRowValue(row,
+            'prep name', 'name', 'product name', 'item name', 'item', 'nombre'
           );
-          if (byCode.length > 0) productRow = byCode[0];
-        }
+          if (!prepName)                         { skipped++; continue; }
+          if (isNaN(quantity) || quantity === 0) { skipped++; continue; }
 
-        if (!productRow && productName) {
-          const [byName] = await connection.execute(
-            `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
-               p.full_weight_base_unit  as full_weight,
-               p.empty_weight_base_unit as empty_weight,
-               p.wholesale_price, p.case_size, p.container_size, p.container_unit
-             FROM products p
-             INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
-             WHERE LOWER(TRIM(p.product_name)) = LOWER(TRIM(?)) AND pbs.id_store = ?`,
-            [productName, storeId]
+          const [prepRows] = await connection.execute(
+            `SELECT id_preps, prep_name, yield_quantity, yield_unit, yield_unit_cost, total_cost
+             FROM preps
+             WHERE LOWER(TRIM(prep_name)) = LOWER(TRIM(?)) AND id_store = ?`,
+            [prepName, storeId]
           );
-          if (byName.length > 0) productRow = byName[0];
-        }
 
-        if (!productRow) {
-          errors.push(`Row ${rowNum}: Product "${productName || productCode}" not found in this store`);
-          skipped++;
-          continue;
-        }
+          if (prepRows.length === 0) {
+            errors.push(`Row ${rowNum}: Prep "${prepName}" not found in this store`);
+            skipped++;
+            continue;
+          }
 
-        const weightType     = containerTypeExcel || productRow.container_type || 'Bottle';
-        const containerTypes = ['Bottle', 'Keg', 'Can', 'Each', 'Box', 'Bag', 'Carton'];
-        let wholesaleValue   = 0;
+          const prep    = prepRows[0];
+          const wsValue = calcPrepWholesaleValue(
+            quantity, prep.yield_unit,
+            prep.yield_quantity, prep.yield_unit, prep.total_cost
+          );
 
-        if (productRow.wholesale_price) {
-          const price     = parseFloat(productRow.wholesale_price);
-          const caseSize  = parseFloat(productRow.case_size) || 1;
-          const unitPrice = caseSize > 0 ? price / caseSize : price;
+          prepItemsToInsert.push({
+            prepId:         prep.id_preps,
+            prepName:       prep.prep_name,
+            quantityType:   prep.yield_unit,
+            quantity,
+            wholesaleValue: wsValue,
+            displayOrder:   imported + 1
+          });
+          imported++;
 
-          if (containerTypes.includes(weightType)) {
-            wholesaleValue = quantity * unitPrice;
-          } else if (productRow.full_weight && productRow.empty_weight !== null) {
-            const full  = parseFloat(productRow.full_weight);
-            const empty = parseFloat(productRow.empty_weight);
-            if (full > empty) {
-              const quantityInGrams = quantity * (GRAMS[weightType] || 1);
-              const pct = Math.min(Math.max((quantityInGrams - empty) / (full - empty), 0), 1);
-              wholesaleValue = pct * unitPrice;
+        // ================================
+        // CASO: PRODUCTO
+        // ================================
+        } else {
+          const productCode        = getRowValue(row, 'product code', 'code', 'sku', 'item code', 'codigo');
+          const productName        = getRowValue(row, 'product name', 'name', 'item name', 'item', 'product', 'nombre');
+          const containerTypeExcel = getRowValue(row, 'container type', 'container', 'unit type', 'weight type', 'tipo');
+
+          if (!productCode && !productName) { skipped++; continue; }
+          if (isNaN(quantity))              { skipped++; continue; }
+
+          let productRow = null;
+
+          if (productCode) {
+            const [byCode] = await connection.execute(
+              `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
+                 p.full_weight_base_unit  as full_weight,
+                 p.empty_weight_base_unit as empty_weight,
+                 p.wholesale_price, p.case_size, p.container_size, p.container_unit
+               FROM products p
+               INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+               WHERE LOWER(TRIM(p.product_code)) = LOWER(TRIM(?)) AND pbs.id_store = ?`,
+              [productCode, storeId]
+            );
+            if (byCode.length > 0) productRow = byCode[0];
+          }
+
+          if (!productRow && productName) {
+            const [byName] = await connection.execute(
+              `SELECT p.id_products, p.product_name, p.product_code, p.container_type,
+                 p.full_weight_base_unit  as full_weight,
+                 p.empty_weight_base_unit as empty_weight,
+                 p.wholesale_price, p.case_size, p.container_size, p.container_unit
+               FROM products p
+               INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+               WHERE LOWER(TRIM(p.product_name)) = LOWER(TRIM(?)) AND pbs.id_store = ?`,
+              [productName, storeId]
+            );
+            if (byName.length > 0) productRow = byName[0];
+          }
+
+          if (!productRow) {
+            errors.push(`Row ${rowNum}: Product "${productName || productCode}" not found in this store`);
+            skipped++;
+            continue;
+          }
+
+          const weightType     = containerTypeExcel || productRow.container_type || 'Bottle';
+          const containerTypes = ['Bottle', 'Keg', 'Can', 'Each', 'Box', 'Bag', 'Carton'];
+          let wholesaleValue   = 0;
+
+          if (productRow.wholesale_price) {
+            const price     = parseFloat(productRow.wholesale_price);
+            const caseSize  = parseFloat(productRow.case_size) || 1;
+            const unitPrice = caseSize > 0 ? price / caseSize : price;
+
+            if (containerTypes.includes(weightType)) {
+              wholesaleValue = quantity * unitPrice;
+            } else if (productRow.full_weight && productRow.empty_weight !== null) {
+              const full  = parseFloat(productRow.full_weight);
+              const empty = parseFloat(productRow.empty_weight);
+              if (full > empty) {
+                const quantityInGrams = quantity * (GRAMS[weightType] || 1);
+                const pct = Math.min(Math.max((quantityInGrams - empty) / (full - empty), 0), 1);
+                wholesaleValue = pct * unitPrice;
+              }
             }
           }
-        }
 
-        items.push({
-          productId: productRow.id_products, productName: productRow.product_name,
-          quantityType: weightType, quantity, wholesaleValue,
-          fullWeight: productRow.full_weight || null, emptyWeight: productRow.empty_weight ?? null,
-          caseSize: productRow.case_size || null, displayOrder: imported + 1
-        });
-        imported++;
+          items.push({
+            productId:      productRow.id_products,
+            productName:    productRow.product_name,
+            quantityType:   weightType,
+            quantity,
+            wholesaleValue,
+            fullWeight:     productRow.full_weight  || null,
+            emptyWeight:    productRow.empty_weight ?? null,
+            caseSize:       productRow.case_size    || null,
+            displayOrder:   imported + 1
+          });
+          imported++;
+        }
       } catch (rowError) {
         errors.push(`Row ${rowNum}: ${rowError.message}`);
         skipped++;
       }
     }
 
-    if (items.length === 0) {
+    if (items.length === 0 && prepItemsToInsert.length === 0) {
       await connection.rollback();
-      return res.status(400).json({ success: false, message: 'No valid products found in the file', stats: { total: data.length, imported: 0, skipped, errors } });
+      return res.status(400).json({
+        success: false,
+        message: 'No valid products or preps found in the file',
+        stats: { total: data.length, imported: 0, skipped, errors }
+      });
     }
 
     const [invResult] = await connection.execute(
@@ -870,6 +974,8 @@ const importInventoryFromExcel = async (req, res) => {
     const inventoryId = invResult.insertId;
 
     let totalWsValue = 0;
+
+    // Insertar productos
     for (const item of items) {
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
       const pw      = calcProductWeight(item.quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
@@ -890,13 +996,46 @@ const importInventoryFromExcel = async (req, res) => {
       totalWsValue += item.wholesaleValue;
     }
 
-    await connection.execute(`UPDATE inventories SET total_ws_value = ? WHERE id_inventories = ?`, [totalWsValue, inventoryId]);
+    // Insertar pre-batches
+    const baseOrder = items.length + 1;
+    for (let idx = 0; idx < prepItemsToInsert.length; idx++) {
+      const item = prepItemsToInsert[idx];
+      await connection.execute(
+        `INSERT INTO inventory_items (
+          id_inventory, id_product, id_prep, item_type, id_location, display_order,
+          quantity_type, quantity, case_size,
+          full_weight, empty_weight, net_weight,
+          product_weight, product_weight_grams, product_weight_unit,
+          wholesale_value
+        ) VALUES (?, NULL, ?, 'prep', ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)`,
+        [
+          inventoryId, item.prepId, locationId, baseOrder + idx,
+          item.quantityType, item.quantity,
+          item.quantity, item.quantity, item.quantityType,
+          item.wholesaleValue
+        ]
+      );
+      totalWsValue += item.wholesaleValue;
+    }
+
+    await connection.execute(
+      `UPDATE inventories SET total_ws_value = ? WHERE id_inventories = ?`,
+      [totalWsValue, inventoryId]
+    );
     await connection.commit();
 
     res.status(201).json({
-      success: true, message: 'Import completed',
+      success: true,
+      message: 'Import completed',
       data: { inventoryId, locationId, locationName: 'From Excel' },
-      stats: { total: data.length, imported, skipped, errors: errors.length > 0 ? errors : undefined }
+      stats: {
+        total:            data.length,
+        imported,
+        importedProducts: items.length,
+        importedPreps:    prepItemsToInsert.length,
+        skipped,
+        errors: errors.length > 0 ? errors : undefined
+      }
     });
   } catch (error) {
     await connection.rollback();

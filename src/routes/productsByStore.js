@@ -8,7 +8,8 @@ const {
   assignProductToStore,
   updateProductInStore,
   removeProductFromStore,
-  importProductsByStore  // <-- agregar
+  importProductsByStore,
+  exportProductsByStore  
 } = require('../controllers/productsByStoreController');
 
 // IMPORTANTE: /import debe ir ANTES de /:id para que no lo intercepte
@@ -19,5 +20,6 @@ router.get('/store/:storeId', getProductsByStoreId);
 router.post('/', assignProductToStore);
 router.put('/:id', updateProductInStore);
 router.delete('/:id', removeProductFromStore);
+router.get('/export', exportProductsByStore);
 
 module.exports = router;
