@@ -1,105 +1,125 @@
 const pool = require('../config/database');
 const Papa = require('papaparse');
 
-// Obtener todos los datos POS
+// ── HELPERS (mismos que modifiers) ────────────────────────────────────────
+
+const parseDate = (val) => {
+  if (!val) return null;
+  const str = String(val).trim();
+  if (!str) return null;
+  const d = new Date(str);
+  return isNaN(d.getTime()) ? null : d;
+};
+
+// Soporta 0 correctamente — no usa || null
+const parseDecimal = (val) => {
+  if (val === null || val === undefined || val === '') return null;
+  const n = parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+  return isNaN(n) ? null : n;
+};
+
+const str = (val) => {
+  if (val === null || val === undefined) return null;
+  const s = String(val).trim();
+  return s === '' ? null : s;
+};
+
+const bigint = (val) => {
+  if (val === null || val === undefined || val === '') return null;
+  const s = String(val).trim();
+  return s === '' ? null : s;
+};
+
+const parseBool = (val) => {
+  if (val === true  || val === 1 || String(val).toLowerCase() === 'true')  return 1;
+  if (val === false || val === 0 || String(val).toLowerCase() === 'false') return 0;
+  return 0;
+};
+
+// ── CONTROLLERS ──────────────────────────────────────────────────────────
+
 const getAllPOSData = async (req, res) => {
   try {
+    const { storeId } = req.query;
     const query = `
       SELECT 
-        id_pos_raw as id,
-        id_store as storeId,
+        id_pos_raw            as id,
+        id_store              as storeId,
         location,
-        order_id as orderId,
-        order_number as orderNumber,
-        sent_date as sentDate,
-        order_date as orderDate,
-        check_id as checkId,
+        order_id              as orderId,
+        order_number          as orderNumber,
+        sent_date             as sentDate,
+        order_date            as orderDate,
+        check_id              as checkId,
         server,
-        table_number as tableNumber,
-        dining_area as diningArea,
+        table_number          as tableNumber,
+        dining_area           as diningArea,
         service,
-        dining_option as diningOption,
-        item_selection_id as itemSelectionId,
-        item_id as itemId,
-        master_id as masterId,
+        dining_option         as diningOption,
+        item_selection_id     as itemSelectionId,
+        item_id               as itemId,
+        master_id             as masterId,
         sku,
         plu,
-        menu_item as menuItem,
-        menu_subgroups as menuSubgroups,
-        menu_group as menuGroup,
+        menu_item             as menuItem,
+        menu_subgroups        as menuSubgroups,
+        menu_group            as menuGroup,
         menu,
-        sales_category as salesCategory,
-        gross_price as grossPrice,
+        sales_category        as salesCategory,
+        gross_price           as grossPrice,
         discount,
-        net_price as netPrice,
+        net_price             as netPrice,
         qty,
         tax,
-        is_void as isVoid,
-        is_deferred as isDeferred,
-        is_tax_exempt as isTaxExempt,
-        tax_inclusion_option as taxInclusionOption,
-        dining_option_tax as diningOptionTax,
-        tab_name as tabName,
-        import_date as importDate,
-        file_name as fileName
+        is_void               as isVoid,
+        is_deferred           as isDeferred,
+        is_tax_exempt         as isTaxExempt,
+        tax_inclusion_option  as taxInclusionOption,
+        dining_option_tax     as diningOptionTax,
+        tab_name              as tabName,
+        import_date           as importDate,
+        file_name             as fileName
       FROM pos_raw_data
+      ${storeId ? 'WHERE id_store = ?' : ''}
       ORDER BY order_date DESC, order_id DESC
     `;
-    
-    const [rows] = await pool.execute(query);
-    res.json({
-      success: true,
-      data: rows
-    });
+
+    const params = storeId ? [storeId] : [];
+    const [rows] = await pool.execute(query, params);
+    res.json({ success: true, data: rows });
   } catch (error) {
-    console.error('Error al obtener datos POS:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error al obtener datos POS',
-      error: error.message
-    });
+    console.error('Error fetching POS data:', error);
+    res.status(500).json({ success: false, message: 'Error fetching POS data', error: error.message });
   }
 };
 
-// Importar datos desde CSV
 const importPOSData = async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'No file uploaded'
-      });
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
     const { storeId } = req.body;
-
     if (!storeId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Store ID is required'
-      });
+      return res.status(400).json({ success: false, message: 'Store ID is required' });
     }
 
-    // Parsear el CSV
     const csvString = req.file.buffer.toString('utf-8');
-    
+
     Papa.parse(csvString, {
       header: true,
       skipEmptyLines: true,
-      dynamicTyping: true,
+      dynamicTyping: false, // ← OFF: manejamos tipos manualmente para soportar 0
       complete: async (results) => {
         try {
           const data = results.data;
           let imported = 0;
-          let skipped = 0;
+          let skipped  = 0;
           const errors = [];
 
-          for (const row of data) {
+          for (let i = 0; i < data.length; i++) {
+            const row = data[i];
             try {
-              // Parsear fechas
-              const sentDate = row['Sent Date'] ? new Date(row['Sent Date']) : null;
-              const orderDate = row['Order Date'] ? new Date(row['Order Date']) : null;
-
               await pool.execute(
                 `INSERT INTO pos_raw_data (
                   id_store, location, order_id, order_number, sent_date, order_date,
@@ -108,57 +128,61 @@ const importPOSData = async (req, res) => {
                   menu_subgroups, menu_group, menu, sales_category, gross_price,
                   discount, net_price, qty, tax, is_void, is_deferred, is_tax_exempt,
                   tax_inclusion_option, dining_option_tax, tab_name, file_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                ) VALUES (
+                  ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?
+                )`,
                 [
                   storeId,
-                  row['Location'] || null,
-                  row['Order Id'] || null,
-                  row['Order #'] || null,
-                  sentDate,
-                  orderDate,
-                  row['Check Id'] || null,
-                  row['Server'] || null,
-                  row['Table'] || null,
-                  row['Dining Area'] || null,
-                  row['Service'] || null,
-                  row['Dining Option'] || null,
-                  row['Item Selection Id'] || null,
-                  row['Item Id'] || null,
-                  row['Master Id'] || null,
-                  row['SKU'] || null,
-                  row['PLU'] || null,
-                  row['Menu Item'] || null,
-                  row['Menu Subgroup(s)'] || null,
-                  row['Menu Group'] || null,
-                  row['Menu'] || null,
-                  row['Sales Category'] || null,
-                  row['Gross Price'] || null,
-                  row['Discount'] || null,
-                  row['Net Price'] || null,
-                  row['Qty'] || null,
-                  row['Tax'] || null,
-                  row['Void?'] === true || row['Void?'] === 'true' ? 1 : 0,
-                  row['Deferred'] === true || row['Deferred'] === 'true' ? 1 : 0,
-                  row['Tax Exempt'] === true || row['Tax Exempt'] === 'true' ? 1 : 0,
-                  row['Tax Inclusion Option'] || null,
-                  row['Dining Option Tax'] || null,
-                  row['Tab Name'] || null,
-                  req.file.originalname || null
+                  str(row['Location']),
+                  bigint(row['Order Id']),
+                  str(row['Order #']),
+                  parseDate(row['Sent Date']),
+                  parseDate(row['Order Date']),
+                  bigint(row['Check Id']),
+                  str(row['Server']),
+                  str(row['Table']),
+                  str(row['Dining Area']),
+                  str(row['Service']),
+                  str(row['Dining Option']),
+                  bigint(row['Item Selection Id']),
+                  bigint(row['Item Id']),
+                  bigint(row['Master Id']),
+                  str(row['SKU']),
+                  str(row['PLU']),
+                  str(row['Menu Item']),
+                  str(row['Menu Subgroup(s)']),
+                  str(row['Menu Group']),
+                  str(row['Menu']),
+                  str(row['Sales Category']),
+                  parseDecimal(row['Gross Price']),  // ✅ soporta 0.00
+                  parseDecimal(row['Discount']),      // ✅ soporta 0.00
+                  parseDecimal(row['Net Price']),     // ✅ soporta 0.00
+                  parseDecimal(row['Qty']),           // ✅ soporta 0
+                  parseDecimal(row['Tax']),           // ✅ soporta 0.00
+                  parseBool(row['Void?']),
+                  parseBool(row['Deferred']),
+                  parseBool(row['Tax Exempt']),
+                  str(row['Tax Inclusion Option']),
+                  str(row['Dining Option Tax']),
+                  str(row['Tab Name']),
+                  str(req.file.originalname)
                 ]
               );
               imported++;
-            } catch (error) {
+            } catch (rowError) {
               skipped++;
-              errors.push({
-                row: row,
-                error: error.message
-              });
+              errors.push(`Row ${i + 2}: ${rowError.message}`);
             }
           }
 
           res.json({
             success: true,
-            message: 'Importación completada',
+            message: 'Import completed',
             stats: {
               total: data.length,
               imported,
@@ -168,84 +192,47 @@ const importPOSData = async (req, res) => {
           });
         } catch (error) {
           console.error('Error processing CSV:', error);
-          res.status(500).json({
-            success: false,
-            message: 'Error processing CSV',
-            error: error.message
-          });
+          res.status(500).json({ success: false, message: 'Error processing CSV', error: error.message });
         }
       },
       error: (error) => {
-        res.status(500).json({
-          success: false,
-          message: 'Error parsing CSV',
-          error: error.message
-        });
+        res.status(500).json({ success: false, message: 'Error parsing CSV', error: error.message });
       }
     });
   } catch (error) {
-    console.error('Error al importar datos POS:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error al importar datos POS',
-      error: error.message
-    });
+    console.error('Error importing POS data:', error);
+    res.status(500).json({ success: false, message: 'Error importing POS data', error: error.message });
   }
 };
 
-// Eliminar registro individual
 const deletePOSRecord = async (req, res) => {
   try {
     const { id } = req.params;
-    
     const [result] = await pool.execute(
-      'DELETE FROM pos_raw_data WHERE id_pos_raw = ?',
-      [id]
+      'DELETE FROM pos_raw_data WHERE id_pos_raw = ?', [id]
     );
-    
     if (result.affectedRows === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Registro no encontrado'
-      });
+      return res.status(404).json({ success: false, message: 'Record not found' });
     }
-    
-    res.json({
-      success: true,
-      message: 'Registro eliminado exitosamente'
-    });
+    res.json({ success: true, message: 'Record deleted successfully' });
   } catch (error) {
-    console.error('Error al eliminar registro:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error al eliminar el registro',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error deleting record', error: error.message });
   }
 };
 
-// Limpiar todos los datos de una tienda
 const clearStoreData = async (req, res) => {
   try {
     const { storeId } = req.params;
-    
     const [result] = await pool.execute(
-      'DELETE FROM pos_raw_data WHERE id_store = ?',
-      [storeId]
+      'DELETE FROM pos_raw_data WHERE id_store = ?', [storeId]
     );
-    
     res.json({
       success: true,
-      message: `${result.affectedRows} registros eliminados`,
+      message: `${result.affectedRows} records deleted`,
       deletedCount: result.affectedRows
     });
   } catch (error) {
-    console.error('Error al limpiar datos:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error al limpiar los datos',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error clearing data', error: error.message });
   }
 };
 

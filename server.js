@@ -76,6 +76,9 @@ app.use('/api/notifications', notificationsRoutes);
 const invoicesRoutes = require('./src/routes/invoices');
 app.use('/api/invoices', invoicesRoutes);
 
+const modifiersRoutes = require('./src/routes/modifiers')
+app.use('/api/modifiers', modifiersRoutes);
+
 // Manejo de rutas no encontradas
 app.use((req, res) => {
   res.status(404).json({
