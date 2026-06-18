@@ -22,26 +22,6 @@ const getDescendantPrepIds = async (prepId, visited = new Set()) => {
 };
 
 // ============================================================
-// HELPER: calcular costo de un prep recursivamente
-// Usado internamente al guardar para actualizar total_cost
-// ============================================================
-const calcPrepCostRecursive = async (connection, prepId, depth = 0) => {
-  if (depth > 10) return 0; // límite de profundidad
-
-  const [ingredients] = await connection.execute(
-    `SELECT item_type, id_product, id_prep_ref, quantity, unit, unit_cost, total_cost
-     FROM prep_ingredients WHERE id_prep = ?`,
-    [prepId]
-  );
-
-  let total = 0;
-  for (const ing of ingredients) {
-    total += parseFloat(ing.total_cost) || 0;
-  }
-  return total;
-};
-
-// ============================================================
 // GET ALL PREPS
 // ============================================================
 const getAllPreps = async (req, res) => {
@@ -51,16 +31,30 @@ const getAllPreps = async (req, res) => {
 
     const [preps] = await pool.execute(`
       SELECT
-        p.id_preps as id,
-        p.prep_name as name,
-        p.total_cost as totalCost,
-        p.yield_quantity as yieldQuantity,
-        p.yield_unit as yieldUnit,
-        p.yield_unit_cost as yieldUnitCost,
-        p.created_at as createdAt,
-        COUNT(pi.id_prep_ingredient) as ingredientCount
+        p.id_preps                        AS id,
+        p.prep_name                       AS name,
+        p.total_cost                      AS totalCost,
+        p.yield_quantity                  AS yieldQuantity,
+        p.yield_unit                      AS yieldUnit,
+        p.yield_unit_cost                 AS yieldUnitCost,
+        p.created_at                      AS createdAt,
+        COUNT(pi.id_prep_ingredient)      AS ingredientCount,
+        ANY_VALUE(main_ing.main_name)     AS mainIngredientName,
+        ANY_VALUE(main_ing.main_qty)      AS mainIngredientQty,
+        ANY_VALUE(main_ing.main_unit)     AS mainIngredientUnit
       FROM preps p
       LEFT JOIN prep_ingredients pi ON p.id_preps = pi.id_prep
+      LEFT JOIN (
+        SELECT
+          pi2.id_prep,
+          COALESCE(prod.product_name, pr2.prep_name) AS main_name,
+          pi2.quantity                               AS main_qty,
+          pi2.unit                                   AS main_unit
+        FROM prep_ingredients pi2
+        LEFT JOIN products prod ON pi2.id_product  = prod.id_products AND pi2.item_type = 'product'
+        LEFT JOIN preps    pr2  ON pi2.id_prep_ref = pr2.id_preps     AND pi2.item_type = 'prep'
+        WHERE pi2.is_main = 1
+      ) main_ing ON p.id_preps = main_ing.id_prep
       WHERE p.id_store = ?
       GROUP BY p.id_preps
       ORDER BY p.prep_name`, [storeId]
@@ -74,32 +68,39 @@ const getAllPreps = async (req, res) => {
 };
 
 // ============================================================
-// GET PREP BY ID — incluye sub-preps
+// GET PREP BY ID — incluye ingredientes y sub-preps con isMain
 // ============================================================
 const getPrepById = async (req, res) => {
   try {
     const { id } = req.params;
 
     const [preps] = await pool.execute(`
-      SELECT 
-        id_preps as id, id_store as storeId,
-        prep_name as name, total_cost as totalCost,
-        yield_quantity as yieldQuantity, yield_unit as yieldUnit,
-        yield_unit_cost as yieldUnitCost, created_at as createdAt
+      SELECT
+        id_preps        AS id,
+        id_store        AS storeId,
+        prep_name       AS name,
+        total_cost      AS totalCost,
+        yield_quantity  AS yieldQuantity,
+        yield_unit      AS yieldUnit,
+        yield_unit_cost AS yieldUnitCost,
+        created_at      AS createdAt
       FROM preps WHERE id_preps = ?`, [id]
     );
 
-    if (preps.length === 0) return res.status(404).json({ success: false, message: 'Preparation not found' });
+    if (preps.length === 0)
+      return res.status(404).json({ success: false, message: 'Preparation not found' });
 
     // Ingredientes tipo product
     const [ingredients] = await pool.execute(`
       SELECT
-        pi.id_prep_ingredient as id,
-        pi.id_product as productId,
-        p.product_name as productName,
-        pi.quantity, pi.unit,
-        pi.unit_cost as unitCost,
-        pi.total_cost as totalCost
+        pi.id_prep_ingredient AS id,
+        pi.id_product         AS productId,
+        p.product_name        AS productName,
+        pi.quantity,
+        pi.unit,
+        pi.unit_cost          AS unitCost,
+        pi.total_cost         AS totalCost,
+        pi.is_main            AS isMain
       FROM prep_ingredients pi
       INNER JOIN products p ON pi.id_product = p.id_products
       WHERE pi.id_prep = ? AND pi.item_type = 'product'
@@ -109,15 +110,17 @@ const getPrepById = async (req, res) => {
     // Sub-preps tipo prep
     const [subPreps] = await pool.execute(`
       SELECT
-        pi.id_prep_ingredient as id,
-        pi.id_prep_ref as prepId,
-        pr.prep_name as prepName,
-        pr.total_cost as prepCost,
-        pr.yield_quantity as baseQuantity,
-        pr.yield_unit as baseUnit,
-        pi.quantity, pi.unit,
-        pi.unit_cost as unitCost,
-        pi.total_cost as totalCost
+        pi.id_prep_ingredient AS id,
+        pi.id_prep_ref        AS prepId,
+        pr.prep_name          AS prepName,
+        pr.total_cost         AS prepCost,
+        pr.yield_quantity     AS baseQuantity,
+        pr.yield_unit         AS baseUnit,
+        pi.quantity,
+        pi.unit,
+        pi.unit_cost          AS unitCost,
+        pi.total_cost         AS totalCost,
+        pi.is_main            AS isMain
       FROM prep_ingredients pi
       INNER JOIN preps pr ON pi.id_prep_ref = pr.id_preps
       WHERE pi.id_prep = ? AND pi.item_type = 'prep'
@@ -154,7 +157,7 @@ const createPrep = async (req, res) => {
       return res.status(400).json({ success: false, message: 'At least one ingredient or sub-preparation is required' });
     }
 
-    // Nombre único
+    // Nombre único por store
     const [existing] = await connection.execute(
       'SELECT id_preps FROM preps WHERE LOWER(TRIM(prep_name)) = LOWER(TRIM(?)) AND id_store = ?',
       [name, storeId]
@@ -166,8 +169,8 @@ const createPrep = async (req, res) => {
 
     // Calcular costo total
     let totalCost = 0;
-    ingredients.forEach(ing  => { totalCost += parseFloat(ing.totalCost) || 0; });
-    subPreps.forEach(sp      => { totalCost += parseFloat(sp.totalCost)  || 0; });
+    ingredients.forEach(ing => { totalCost += parseFloat(ing.totalCost) || 0; });
+    subPreps.forEach(sp     => { totalCost += parseFloat(sp.totalCost)  || 0; });
 
     const yieldUnitCost = yieldQuantity && parseFloat(yieldQuantity) > 0
       ? totalCost / parseFloat(yieldQuantity)
@@ -184,9 +187,10 @@ const createPrep = async (req, res) => {
     // Insertar ingredientes (productos)
     for (const ing of ingredients) {
       await connection.execute(
-        `INSERT INTO prep_ingredients (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'product', ?, ?, ?, ?)`,
-        [prepId, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost]
+        `INSERT INTO prep_ingredients
+           (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main)
+         VALUES (?, ?, 'product', ?, ?, ?, ?, ?)`,
+        [prepId, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost, ing.isMain ? 1 : 0]
       );
     }
 
@@ -207,9 +211,10 @@ const createPrep = async (req, res) => {
         : 0;
 
       await connection.execute(
-        `INSERT INTO prep_ingredients (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'prep', ?, ?, ?, ?)`,
-        [prepId, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost]
+        `INSERT INTO prep_ingredients
+           (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost, is_main)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?)`,
+        [prepId, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost, sp.isMain ? 1 : 0]
       );
     }
 
@@ -244,7 +249,9 @@ const updatePrep = async (req, res) => {
       return res.status(400).json({ success: false, message: 'At least one ingredient or sub-preparation is required' });
     }
 
-    const [existing] = await connection.execute('SELECT id_store FROM preps WHERE id_preps = ?', [id]);
+    const [existing] = await connection.execute(
+      'SELECT id_store FROM preps WHERE id_preps = ?', [id]
+    );
     if (existing.length === 0) {
       await connection.rollback();
       return res.status(404).json({ success: false, message: 'Preparation not found' });
@@ -261,7 +268,7 @@ const updatePrep = async (req, res) => {
       return res.status(409).json({ success: false, message: 'A preparation with that name already exists in this store' });
     }
 
-    // Calcular costo
+    // Calcular costo total
     let totalCost = 0;
     ingredients.forEach(ing => { totalCost += parseFloat(ing.totalCost) || 0; });
     subPreps.forEach(sp     => { totalCost += parseFloat(sp.totalCost)  || 0; });
@@ -272,20 +279,23 @@ const updatePrep = async (req, res) => {
 
     // Actualizar prep
     await connection.execute(
-      `UPDATE preps SET prep_name = ?, total_cost = ?, yield_quantity = ?, yield_unit = ?,
-       yield_unit_cost = ?, updated_at = CURRENT_TIMESTAMP WHERE id_preps = ?`,
+      `UPDATE preps
+       SET prep_name = ?, total_cost = ?, yield_quantity = ?, yield_unit = ?,
+           yield_unit_cost = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id_preps = ?`,
       [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, id]
     );
 
-    // Limpiar ingredientes
+    // Limpiar ingredientes anteriores
     await connection.execute('DELETE FROM prep_ingredients WHERE id_prep = ?', [id]);
 
     // Insertar ingredientes (productos)
     for (const ing of ingredients) {
       await connection.execute(
-        `INSERT INTO prep_ingredients (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'product', ?, ?, ?, ?)`,
-        [id, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost]
+        `INSERT INTO prep_ingredients
+           (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main)
+         VALUES (?, ?, 'product', ?, ?, ?, ?, ?)`,
+        [id, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost, ing.isMain ? 1 : 0]
       );
     }
 
@@ -312,9 +322,10 @@ const updatePrep = async (req, res) => {
         : 0;
 
       await connection.execute(
-        `INSERT INTO prep_ingredients (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'prep', ?, ?, ?, ?)`,
-        [id, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost]
+        `INSERT INTO prep_ingredients
+           (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost, is_main)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?)`,
+        [id, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost, sp.isMain ? 1 : 0]
       );
     }
 
@@ -336,7 +347,8 @@ const deletePrep = async (req, res) => {
   try {
     const { id } = req.params;
     const [result] = await pool.execute('DELETE FROM preps WHERE id_preps = ?', [id]);
-    if (result.affectedRows === 0) return res.status(404).json({ success: false, message: 'Preparation not found' });
+    if (result.affectedRows === 0)
+      return res.status(404).json({ success: false, message: 'Preparation not found' });
     res.json({ success: true, message: 'Preparation deleted successfully' });
   } catch (error) {
     console.error('Error deleting preparation:', error);
