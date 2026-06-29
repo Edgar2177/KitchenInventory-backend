@@ -347,6 +347,13 @@ const calculateOrderSuggestions = async (req, res) => {
       });
     });
 
+    console.log('🏪 Vendor groups keys:', Object.keys(vendorGroups));
+    console.log('🏪 Italian Centre entries:', 
+      Object.entries(vendorGroups)
+        .filter(([k,v]) => v.vendor_name === 'ITALIAN CENTRE')
+        .map(([k,v]) => ({ key: k, products: v.products.length }))
+    );
+
     res.json({
       success: true,
       data: {
