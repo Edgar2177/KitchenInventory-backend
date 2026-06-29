@@ -344,6 +344,11 @@ const calculateOrderSuggestions = async (req, res) => {
       });
     });
 
+    const missing = Object.values(vendorGroups)
+      .flatMap(v => v.products)
+      .filter(p => p.is_missing_from_inventory);
+    console.log('Missing products:', missing.map(p => p.product_name));
+
     res.json({
       success: true,
       data: {
