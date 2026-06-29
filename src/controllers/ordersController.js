@@ -155,11 +155,17 @@ const calculateOrderSuggestions = async (req, res) => {
     );
     const currentInvDate = currentInvRow?.inv_date || null;
 
-    // ── Items del inventario actual ───────────────────────────────────────────
-    // FIX: filtramos por DATE(inventory_date) para incluir todas las locations
-    // del mismo día, pero usando id_inventories como referencia de fecha exacta.
-    // Esto evita que productos contados en otras locations de otro día
-    // aparezcan incorrectamente como "contados".
+    // ── IDs de todos los inventarios de la misma fecha (todas las locations) ──
+    const [sameeDateInvs] = await pool.execute(
+      `SELECT id_inventories
+       FROM inventories
+       WHERE id_store = ? AND status = 'Locked'
+         AND DATE(inventory_date) = ?`,
+      [storeId, currentInvDate]
+    );
+    const sameDateIds = sameeDateInvs.map(r => r.id_inventories);
+
+    // ── Items del inventario actual (todas las locations de ese día) ──────────
     const [inventoryItems] = await pool.execute(
       `SELECT
         ii.id_product,
@@ -169,11 +175,8 @@ const calculateOrderSuggestions = async (req, res) => {
         ii.empty_weight,
         ii.net_weight
       FROM inventory_items ii
-      INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
-      WHERE i.id_store = ?
-        AND i.status = 'Locked'
-        AND DATE(i.inventory_date) = ?`,
-      [storeId, currentInvDate]
+      WHERE ii.id_inventory IN (${sameDateIds.map(() => '?').join(',')})`,
+      sameDateIds
     );
 
     // ── Inventario anterior ───────────────────────────────────────────────────
@@ -343,11 +346,6 @@ const calculateOrderSuggestions = async (req, res) => {
         is_missing_from_inventory: !countedProductIds.has(productKey)
       });
     });
-
-    const missing = Object.values(vendorGroups)
-      .flatMap(v => v.products)
-      .filter(p => p.is_missing_from_inventory);
-    console.log('Missing products:', missing.map(p => p.product_name));
 
     res.json({
       success: true,
