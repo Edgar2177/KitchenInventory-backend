@@ -201,8 +201,9 @@ const calculateOrderSuggestions = async (req, res) => {
         [storeId, prevInvDate]
       );
       prevItems.forEach(item => {
-        if (!prevItemsByProduct[item.id_product]) prevItemsByProduct[item.id_product] = [];
-        prevItemsByProduct[item.id_product].push(item);
+        const key = String(item.id_product);
+        if (!prevItemsByProduct[key]) prevItemsByProduct[key] = [];
+        prevItemsByProduct[key].push(item);
       });
     }
 
@@ -226,7 +227,7 @@ const calculateOrderSuggestions = async (req, res) => {
           [storeId, prevInvDate, currentInvDate]
         );
         purchases.forEach(p => {
-          purchaseByProduct[p.id_product] = parseFloat(p.total_qty) || 0;
+          purchaseByProduct[String(p.id_product)] = parseFloat(p.total_qty) || 0;
         });
       } catch (e) {
         console.warn('⚠️  Error fetching purchases:', e.message);
@@ -236,11 +237,13 @@ const calculateOrderSuggestions = async (req, res) => {
     // ── Agrupar items del inventario actual por producto ──────────────────────
     const itemsByProduct = {};
     inventoryItems.forEach(item => {
-      if (!itemsByProduct[item.id_product]) itemsByProduct[item.id_product] = [];
-      itemsByProduct[item.id_product].push(item);
+      const key = String(item.id_product);
+      if (!itemsByProduct[key]) itemsByProduct[key] = [];
+      itemsByProduct[key].push(item);
     });
 
-    const countedProductIds = new Set(Object.keys(itemsByProduct).map(Number));
+    // FIX: usar strings en todo el Set para evitar mismatch de tipos
+    const countedProductIds = new Set(Object.keys(itemsByProduct));
 
     const productMap = {};
     productsWithVendors.forEach(p => { productMap[p.id_products] = p; });
@@ -249,7 +252,8 @@ const calculateOrderSuggestions = async (req, res) => {
     const stockMap = {};
     countedProductIds.forEach(productId => {
       const rows    = itemsByProduct[productId];
-      const product = productMap[productId];
+      // FIX: productMap usa id_products numérico, productId es string → Number()
+      const product = productMap[Number(productId)];
       if (!product) return;
       const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
       stockMap[productId] = calcStockUnits(rows, containerSizeBaseUnit);
@@ -271,12 +275,15 @@ const calculateOrderSuggestions = async (req, res) => {
         };
       }
 
+      const productKey            = String(product.id_products);
       const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
-      const stockOnHand   = stockMap[product.id_products] !== undefined ? stockMap[product.id_products] : 0;
-      const reorderPoint  = parseFloat(product.reorder_point) || 0;
-      const par           = parseFloat(product.par)           || 0;
-      const caseSize      = parseFloat(product.case_size)     || 1;
-      const orderBy       = product.order_by || product.container_type;
+
+      // FIX: stockMap fue llenado con string keys → usar String()
+      const stockOnHand  = stockMap[productKey] !== undefined ? stockMap[productKey] : 0;
+      const reorderPoint = parseFloat(product.reorder_point) || 0;
+      const par          = parseFloat(product.par)           || 0;
+      const caseSize     = parseFloat(product.case_size)     || 1;
+      const orderBy      = product.order_by || product.container_type;
       const isOrderByCase = orderBy === 'Case';
 
       const parForCalc     = isOrderByCase ? par / caseSize         : par;
@@ -296,14 +303,14 @@ const calculateOrderSuggestions = async (req, res) => {
       }
 
       // ── Opening Last Inv ────────────────────────────────────────────────────
-      const prevRows   = prevItemsByProduct[product.id_products] || [];
+      const prevRows   = prevItemsByProduct[productKey] || [];
       const openingRaw = prevRows.length > 0
         ? calcStockUnits(prevRows, containerSizeBaseUnit)
         : 0;
       const openingLastInv = isOrderByCase ? openingRaw / caseSize : openingRaw;
 
       // ── Purchase ────────────────────────────────────────────────────────────
-      const purchaseRaw = purchaseByProduct[product.id_products] || 0;
+      const purchaseRaw = purchaseByProduct[productKey] || 0;
       const purchase = isOrderByCase ? purchaseRaw / caseSize : purchaseRaw;
 
       // ── Sold ────────────────────────────────────────────────────────────────
@@ -333,7 +340,8 @@ const calculateOrderSuggestions = async (req, res) => {
         suggested_order:           suggestedOrder,
         actual_order:              0,
         unit_price:                parseFloat(unitPrice.toFixed(4)),
-        is_missing_from_inventory: !countedProductIds.has(product.id_products)
+        // FIX: usar String() para comparar con countedProductIds (Set de strings)
+        is_missing_from_inventory: !countedProductIds.has(String(product.id_products))
       });
     });
 
@@ -494,7 +502,7 @@ const sendOrderEmail = async (req, res) => {
       order_date:   order.order_date,
       store_name:   order.store_name,
       vendor_name:  order.vendor_name,
-      sent_by:      emailConfig.sentBy || 'System',   // ← usuario que envió
+      sent_by:      emailConfig.sentBy || 'System',
       items: items.map(item => ({
         product_code: item.product_code || '-',
         product_name: item.product_name,

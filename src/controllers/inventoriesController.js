@@ -165,10 +165,6 @@ const getOrCreateFromExcelLocation = async (storeId) => {
 };
 
 // ========================================
-// CONTROLADORES
-// ========================================
-
-// ========================================
 // HELPER: Lectura de columnas flexible (case-insensitive)
 // ========================================
 const getRowValue = (row, ...names) => {
@@ -183,6 +179,10 @@ const getRowValue = (row, ...names) => {
   }
   return null;
 };
+
+// ========================================
+// CONTROLADORES
+// ========================================
 
 const getAllInventories = async (req, res) => {
   try {
@@ -233,7 +233,6 @@ const getInventoryById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Inventory not found' });
     }
 
-    // ✅ Agrega category_name y product_type_name para Group By
     const [items] = await pool.execute(
       `SELECT 
         ii.*,
@@ -298,7 +297,6 @@ const getAvailableProducts = async (req, res) => {
       return res.status(400).json({ success: false, message: 'storeId es requerido' });
     }
 
-    // ✅ Agrega category_name y product_type_name para Group By
     const [products] = await pool.execute(
       `SELECT 
         p.id_products as id,
@@ -726,7 +724,6 @@ const getLastInventoryProducts = async (req, res) => {
 
     const lastInventoryId = lastInventory[0].id_inventories;
 
-    // ✅ Agrega category_name y product_type_name para Group By
     const [items] = await pool.execute(
       `SELECT 
         ii.display_order, ii.quantity_type, ii.full_weight, ii.empty_weight, ii.net_weight,
@@ -767,6 +764,202 @@ const getLastInventoryProducts = async (req, res) => {
 };
 
 // ========================================
+// NUEVO: Lista de inventarios por location
+// GET /inventories/by-location/:locationId
+// ========================================
+const getInventoriesByLocation = async (req, res) => {
+  try {
+    const { locationId } = req.params;
+    if (!locationId) {
+      return res.status(400).json({ success: false, message: 'locationId is required' });
+    }
+
+    const [inventories] = await pool.execute(
+      `SELECT
+         i.id_inventories,
+         i.inventory_date,
+         i.status,
+         COUNT(DISTINCT ii.id_inventory_item) as total_products
+       FROM inventories i
+       LEFT JOIN inventory_items ii ON i.id_inventories = ii.id_inventory
+       WHERE i.id_location = ?
+       GROUP BY i.id_inventories, i.inventory_date, i.status
+       ORDER BY i.inventory_date DESC, i.id_inventories DESC
+       LIMIT 20`,
+      [locationId]
+    );
+
+    res.json({ success: true, data: inventories });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching inventories by location',
+      error: error.message
+    });
+  }
+};
+
+// ========================================
+// NUEVO: Productos de un inventario específico
+// GET /inventories/:inventoryId/products?uncountedOnly=true
+// ========================================
+const getInventoryProducts = async (req, res) => {
+  try {
+    const { inventoryId } = req.params;
+    const uncountedOnly   = req.query.uncountedOnly === 'true';
+
+    if (!inventoryId) {
+      return res.status(400).json({ success: false, message: 'inventoryId is required' });
+    }
+
+    // Primero obtenemos el storeId del inventario para poder buscar en products_by_store
+    const [invRow] = await pool.execute(
+      'SELECT id_store FROM inventories WHERE id_inventories = ?',
+      [inventoryId]
+    );
+    if (invRow.length === 0) {
+      return res.status(404).json({ success: false, message: 'Inventory not found' });
+    }
+    const storeId = invRow[0].id_store;
+
+    let items, prepData;
+
+    if (uncountedOnly) {
+      // ── MODO UNCOUNTED ─────────────────────────────────────────────────────
+      // Un producto "no contado" es aquel que:
+      //   1. Existe en products_by_store para esta tienda, Y
+      //   2. NO aparece en inventory_items de este inventario
+      //      O aparece pero con quantity IS NULL / quantity < 0.01
+      // Igual que "is_missing_from_inventory" en el módulo de Ordering.
+      [items] = await pool.execute(
+        `SELECT
+           COALESCE(ii.display_order, 9999)  AS display_order,
+           COALESCE(ii.quantity_type, p.container_type) AS quantity_type,
+           ii.quantity,
+           COALESCE(ii.full_weight,  p.full_weight_base_unit)  AS full_weight,
+           COALESCE(ii.empty_weight, p.empty_weight_base_unit) AS empty_weight,
+           ii.net_weight,
+           p.id_products       AS productId,
+           p.product_name      AS productName,
+           p.product_code      AS productCode,
+           p.container_type    AS containerType,
+           p.container_size    AS containerSize,
+           p.container_unit    AS containerUnit,
+           p.case_size         AS caseSize,
+           p.full_weight_base_unit  AS product_full_weight,
+           p.empty_weight_base_unit AS product_empty_weight,
+           p.wholesale_price   AS wholesalePrice,
+           c.category_name,
+           pt.product_name     AS product_type_name
+         FROM products_by_store pbs
+         INNER JOIN products p   ON pbs.id_product     = p.id_products
+         LEFT  JOIN inventory_items ii
+               ON  ii.id_product   = p.id_products
+               AND ii.id_inventory = ?
+               AND ii.item_type    = 'product'
+         LEFT  JOIN categories c    ON p.id_category     = c.id_categories
+         LEFT  JOIN product_types pt ON p.id_product_type = pt.id_product_types
+         WHERE pbs.id_store = ?
+           AND (
+             ii.id_inventory_item IS NULL          -- no aparece en el inventario
+             OR ii.quantity IS NULL                 -- aparece pero sin cantidad
+             OR ii.quantity < 0.01                  -- aparece con cantidad 0 o 0.00
+           )
+         ORDER BY c.category_name ASC, p.product_name ASC`,
+        [inventoryId, storeId]
+      );
+
+      // Preps no contados: los que existen en la tienda pero no están en este inventario
+      // o están con quantity < 0.01
+      [prepData] = await pool.execute(
+        `SELECT
+           COALESCE(ii.display_order, 9999) AS display_order,
+           COALESCE(ii.quantity_type, pr.yield_unit) AS quantity_type,
+           ii.quantity,
+           pr.id_preps         AS prepId,
+           pr.prep_name        AS prepName,
+           pr.yield_quantity   AS yieldQuantity,
+           pr.yield_unit       AS yieldUnit,
+           pr.yield_unit_cost  AS yieldUnitCost,
+           pr.total_cost       AS totalCost
+         FROM preps pr
+         LEFT JOIN inventory_items ii
+               ON  ii.id_prep      = pr.id_preps
+               AND ii.id_inventory = ?
+               AND ii.item_type    = 'prep'
+         WHERE pr.id_store = ?
+           AND (
+             ii.id_inventory_item IS NULL
+             OR ii.quantity IS NULL
+             OR ii.quantity < 0.01
+           )
+         ORDER BY pr.prep_name ASC`,
+        [inventoryId, storeId]
+      );
+
+    } else {
+      // ── MODO NORMAL: todos los productos que sí están en inventory_items ──
+      [items] = await pool.execute(
+        `SELECT
+           ii.display_order,
+           ii.quantity_type,
+           ii.quantity,
+           ii.full_weight,
+           ii.empty_weight,
+           ii.net_weight,
+           p.id_products       AS productId,
+           p.product_name      AS productName,
+           p.product_code      AS productCode,
+           p.container_type    AS containerType,
+           p.container_size    AS containerSize,
+           p.container_unit    AS containerUnit,
+           p.case_size         AS caseSize,
+           p.full_weight_base_unit  AS product_full_weight,
+           p.empty_weight_base_unit AS product_empty_weight,
+           p.wholesale_price   AS wholesalePrice,
+           c.category_name,
+           pt.product_name     AS product_type_name
+         FROM inventory_items ii
+         INNER JOIN products p   ON ii.id_product     = p.id_products
+         LEFT  JOIN categories c    ON p.id_category     = c.id_categories
+         LEFT  JOIN product_types pt ON p.id_product_type = pt.id_product_types
+         WHERE ii.id_inventory = ?
+           AND ii.item_type = 'product'
+         ORDER BY ii.display_order ASC`,
+        [inventoryId]
+      );
+
+      [prepData] = await pool.execute(
+        `SELECT
+           ii.display_order,
+           ii.quantity_type,
+           ii.quantity,
+           pr.id_preps         AS prepId,
+           pr.prep_name        AS prepName,
+           pr.yield_quantity   AS yieldQuantity,
+           pr.yield_unit       AS yieldUnit,
+           pr.yield_unit_cost  AS yieldUnitCost,
+           pr.total_cost       AS totalCost
+         FROM inventory_items ii
+         INNER JOIN preps pr ON ii.id_prep = pr.id_preps
+         WHERE ii.id_inventory = ?
+           AND ii.item_type = 'prep'
+         ORDER BY ii.display_order ASC`,
+        [inventoryId]
+      );
+    }
+
+    res.json({ success: true, data: items, prepData, inventoryId });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching inventory products',
+      error: error.message
+    });
+  }
+};
+
+// ========================================
 // IMPORTAR INVENTARIO DESDE EXCEL
 // ========================================
 const importInventoryFromExcel = async (req, res) => {
@@ -783,7 +976,6 @@ const importInventoryFromExcel = async (req, res) => {
     const workbook   = XLSX.read(req.file.buffer, { type: 'buffer' });
     const worksheet  = workbook.Sheets[workbook.SheetNames[0]];
 
-    // ✅ Detectar automáticamente si el archivo tiene headers o no
     const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null });
 
     if (rawRows.length === 0) {
@@ -818,11 +1010,9 @@ const importInventoryFromExcel = async (req, res) => {
       const row    = data[i];
       const rowNum = i + 2;
 
-      // Detectar si la fila es prep o producto
       const rawType = getRowValue(row, 'type', 'item type', 'item_type');
       const isPrep  = rawType && ['prep', 'pre-batch', 'prebatch', 'pre batch'].includes(rawType.toLowerCase());
 
-      // Cantidad con nombres de columna flexibles
       const rawQuantity = getRowValue(row,
         'closing inv', 'closing inventory', 'quantity', 'qty',
         'inv', 'count', 'inventory', 'cantidad'
@@ -830,9 +1020,6 @@ const importInventoryFromExcel = async (req, res) => {
       const quantity = parseFloat(rawQuantity) || 0;
 
       try {
-        // ================================
-        // CASO: PRE-BATCH / PREP
-        // ================================
         if (isPrep) {
           const prepName = getRowValue(row,
             'prep name', 'name', 'product name', 'item name', 'item', 'nombre'
@@ -869,9 +1056,6 @@ const importInventoryFromExcel = async (req, res) => {
           });
           imported++;
 
-        // ================================
-        // CASO: PRODUCTO
-        // ================================
         } else {
           const productCode        = getRowValue(row, 'product code', 'code', 'sku', 'item code', 'codigo');
           const productName        = getRowValue(row, 'product name', 'name', 'item name', 'item', 'product', 'nombre');
@@ -975,7 +1159,6 @@ const importInventoryFromExcel = async (req, res) => {
 
     let totalWsValue = 0;
 
-    // Insertar productos
     for (const item of items) {
       const weights = await calculateNetWeight(connection, item.productId, item.fullWeight, item.emptyWeight);
       const pw      = calcProductWeight(item.quantity, item.quantityType, weights.fullWeight, weights.emptyWeight, weights.netWeight);
@@ -996,7 +1179,6 @@ const importInventoryFromExcel = async (req, res) => {
       totalWsValue += item.wholesaleValue;
     }
 
-    // Insertar pre-batches
     const baseOrder = items.length + 1;
     for (let idx = 0; idx < prepItemsToInsert.length; idx++) {
       const item = prepItemsToInsert[idx];
@@ -1046,7 +1228,7 @@ const importInventoryFromExcel = async (req, res) => {
 };
 
 // ========================================
-// GET PRODUCTS FOR PRINT — incluye preps y product_type_name
+// GET PRODUCTS FOR PRINT
 // ========================================
 const getProductsForPrintInventory = async (req, res) => {
   try {
@@ -1066,7 +1248,6 @@ const getProductsForPrintInventory = async (req, res) => {
       return res.json({ success: true, data: [], message: 'No locked inventory found for this location' });
     }
 
-    // ✅ Agrega product_type_name para Group By
     const [productItems] = await pool.execute(
       `SELECT 
         p.id_products,
@@ -1141,5 +1322,7 @@ module.exports = {
   reorderInventoryItems,
   getLastInventoryProducts,
   importInventoryFromExcel,
-  getProductsForPrintInventory
+  getProductsForPrintInventory,
+  getInventoriesByLocation,
+  getInventoryProducts,
 };
