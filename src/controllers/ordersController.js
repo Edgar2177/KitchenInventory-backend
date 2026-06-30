@@ -148,24 +148,7 @@ const calculateOrderSuggestions = async (req, res) => {
       [storeId]
     );
 
-    // ── Fecha del inventario actual ───────────────────────────────────────────
-    const [[currentInvRow]] = await pool.execute(
-      'SELECT DATE(inventory_date) as inv_date FROM inventories WHERE id_inventories = ?',
-      [inventoryId]
-    );
-    const currentInvDate = currentInvRow?.inv_date || null;
-
-    // ── IDs de todos los inventarios de la misma fecha (todas las locations) ──
-    const [sameeDateInvs] = await pool.execute(
-      `SELECT id_inventories
-       FROM inventories
-       WHERE id_store = ? AND status = 'Locked'
-         AND DATE(inventory_date) = ?`,
-      [storeId, currentInvDate]
-    );
-    const sameDateIds = sameeDateInvs.map(r => r.id_inventories);
-
-    // ── Items del inventario actual (todas las locations de ese día) ──────────
+    // Items del inventario actual
     const [inventoryItems] = await pool.execute(
       `SELECT
         ii.id_product,
@@ -175,9 +158,23 @@ const calculateOrderSuggestions = async (req, res) => {
         ii.empty_weight,
         ii.net_weight
       FROM inventory_items ii
-      WHERE ii.id_inventory IN (${sameDateIds.map(() => '?').join(',')})`,
-      sameDateIds
+      INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+      WHERE i.id_store = ?
+        AND i.status = 'Locked'
+        AND DATE(i.inventory_date) = (
+          SELECT DATE(inventory_date)
+          FROM inventories
+          WHERE id_inventories = ?
+        )`,
+      [storeId, inventoryId]
     );
+
+    // ── Fecha del inventario actual ───────────────────────────────────────────
+    const [[currentInvRow]] = await pool.execute(
+      'SELECT DATE(inventory_date) as inv_date FROM inventories WHERE id_inventories = ?',
+      [inventoryId]
+    );
+    const currentInvDate = currentInvRow?.inv_date || null;
 
     // ── Inventario anterior ───────────────────────────────────────────────────
     const [[prevInvRow]] = await pool.execute(
@@ -255,6 +252,7 @@ const calculateOrderSuggestions = async (req, res) => {
     const stockMap = {};
     countedProductIds.forEach(productId => {
       const rows    = itemsByProduct[productId];
+      // FIX: productMap usa id_products numérico, productId es string → Number()
       const product = productMap[Number(productId)];
       if (!product) return;
       const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
@@ -280,6 +278,7 @@ const calculateOrderSuggestions = async (req, res) => {
       const productKey            = String(product.id_products);
       const containerSizeBaseUnit = parseFloat(product.container_size_base_unit) || 1;
 
+      // FIX: stockMap fue llenado con string keys → usar String()
       const stockOnHand  = stockMap[productKey] !== undefined ? stockMap[productKey] : 0;
       const reorderPoint = parseFloat(product.reorder_point) || 0;
       const par          = parseFloat(product.par)           || 0;
@@ -320,8 +319,6 @@ const calculateOrderSuggestions = async (req, res) => {
       // ── Variance ────────────────────────────────────────────────────────────
       const variance = stockForCalc - (openingLastInv + purchase) + sold;
 
-      // FIX: is_missing_from_inventory usa countedProductIds (Set de strings)
-      // y productKey ya es string → comparación correcta
       vendorGroups[vendorId].products.push({
         id_product:                product.id_products,
         product_name:              product.product_name,
@@ -343,16 +340,10 @@ const calculateOrderSuggestions = async (req, res) => {
         suggested_order:           suggestedOrder,
         actual_order:              0,
         unit_price:                parseFloat(unitPrice.toFixed(4)),
-        is_missing_from_inventory: !countedProductIds.has(productKey)
+        // FIX: usar String() para comparar con countedProductIds (Set de strings)
+        is_missing_from_inventory: !countedProductIds.has(String(product.id_products))
       });
     });
-
-    console.log('🏪 Vendor groups keys:', Object.keys(vendorGroups));
-    console.log('🏪 Italian Centre entries:', 
-      Object.entries(vendorGroups)
-        .filter(([k,v]) => v.vendor_name === 'ITALIAN CENTRE')
-        .map(([k,v]) => ({ key: k, products: v.products.length }))
-    );
 
     res.json({
       success: true,
