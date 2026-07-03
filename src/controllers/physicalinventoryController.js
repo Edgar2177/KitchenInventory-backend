@@ -21,6 +21,24 @@ const getOrCreatePhysicalLocation = async (connection, storeId) => {
 };
 
 // ========================================
+// FUNCIÓN AUXILIAR
+// Resolver el precio POR UNIDAD a partir del wholesale_price (precio del
+// contenedor completo) y el case_size. Esto replica exactamente la lógica
+// de resolvePrices() en Inventories.jsx, para que el WS Value calculado
+// aquí en el backend coincida con el que calcula ese módulo.
+//
+// Ej: wholesale_price = $25.00 (precio de la caja), case_size = 12
+//     -> unitPrice = 25 / 12 = $2.08 por unidad
+// Si no hay case_size (o es 0/null), el wholesale_price YA es el precio
+// por unidad, así que se usa tal cual.
+// ========================================
+const resolveUnitPrice = (wholesalePrice, caseSize) => {
+  const price = parseFloat(wholesalePrice) || 0;
+  const size  = parseFloat(caseSize) || 0;
+  return size > 0 ? price / size : price;
+};
+
+// ========================================
 // OBTENER TODOS LOS PHYSICAL INVENTORIES
 // ========================================
 const getAllPhysicalInventories = async (req, res) => {
@@ -86,6 +104,7 @@ const getPhysicalInventoryById = async (req, res) => {
         p.container_unit,
         p.container_type,
         p.wholesale_price,
+        p.case_size,
         p.count_by,
         c.category_name,
         pt.product_name AS product_type_name
@@ -222,6 +241,7 @@ const getPhysicalInventoryById = async (req, res) => {
       category_name:     p.category_name,
       product_type_name: p.product_type_name || 'Other',
       wholesale_price:   p.wholesale_price || 0,
+      case_size:         p.case_size || null,
       container_size:    p.container_size  || null,
       container_unit:    p.container_unit  || '',
       container_type:    p.container_type  || '',
@@ -242,6 +262,7 @@ const getPhysicalInventoryById = async (req, res) => {
       category_name:     'Pre-Batch',
       product_type_name: 'Pre-Batch',
       wholesale_price:   0,
+      case_size:         null,
       container_size:    p.container_size || null,
       container_unit:    p.container_unit || '',
       container_type:    'Each',
@@ -271,6 +292,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
         p.product_name,
         p.product_code,
         p.wholesale_price,
+        p.case_size,
         p.container_size,
         p.container_unit,
         p.container_type,
@@ -394,6 +416,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
     const prepResults = preps.map(p => ({
       ...p,
       id_products:       null,
+      case_size:          null,
       product_type_name: 'Pre-Batch',
       last_inv_quantity: 0
     }));
@@ -422,9 +445,9 @@ const createPhysicalInventory = async (req, res) => {
 
     let totalWs = 0;
     items.forEach(item => {
-      const qty   = parseFloat(item.inv_quantity)   || 0;
-      const price = parseFloat(item.wholesale_price) || 0;
-      totalWs += qty * price;
+      const qty       = parseFloat(item.inv_quantity) || 0;
+      const unitPrice = resolveUnitPrice(item.wholesale_price, item.case_size);
+      totalWs += qty * unitPrice;
     });
 
     const [result] = await connection.execute(
@@ -436,22 +459,22 @@ const createPhysicalInventory = async (req, res) => {
 
     let displayOrder = 1;
     for (const item of items) {
-      const qty   = parseFloat(item.inv_quantity)   || 0;
-      const price = parseFloat(item.wholesale_price) || 0;
+      const qty       = parseFloat(item.inv_quantity) || 0;
+      const unitPrice = resolveUnitPrice(item.wholesale_price, item.case_size);
       if (qty > 0) {
         if (item.item_type === 'prep') {
           await connection.execute(
             `INSERT INTO inventory_items 
               (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
              VALUES (?, NULL, ?, 'prep', ?, ?, 'Each', ?, ?)`,
-            [inventoryId, item.id_preps, locationId, displayOrder, qty, qty * price]
+            [inventoryId, item.id_preps, locationId, displayOrder, qty, qty * unitPrice]
           );
         } else {
           await connection.execute(
             `INSERT INTO inventory_items 
               (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
              VALUES (?, ?, NULL, 'product', ?, ?, 'Each', ?, ?)`,
-            [inventoryId, item.id_products, locationId, displayOrder, qty, qty * price]
+            [inventoryId, item.id_products, locationId, displayOrder, qty, qty * unitPrice]
           );
         }
         displayOrder++;
@@ -511,9 +534,9 @@ const updatePhysicalInventory = async (req, res) => {
 
     let totalWs = 0;
     items.forEach(item => {
-      const qty   = parseFloat(item.inv_quantity)   || 0;
-      const price = parseFloat(item.wholesale_price) || 0;
-      totalWs += qty * price;
+      const qty       = parseFloat(item.inv_quantity) || 0;
+      const unitPrice = resolveUnitPrice(item.wholesale_price, item.case_size);
+      totalWs += qty * unitPrice;
     });
 
     const updates = [];
@@ -533,22 +556,22 @@ const updatePhysicalInventory = async (req, res) => {
 
     let displayOrder = 1;
     for (const item of items) {
-      const qty   = parseFloat(item.inv_quantity)   || 0;
-      const price = parseFloat(item.wholesale_price) || 0;
+      const qty       = parseFloat(item.inv_quantity) || 0;
+      const unitPrice = resolveUnitPrice(item.wholesale_price, item.case_size);
       if (qty > 0) {
         if (item.item_type === 'prep') {
           await connection.execute(
             `INSERT INTO inventory_items 
               (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
              VALUES (?, NULL, ?, 'prep', ?, ?, 'Each', ?, ?)`,
-            [id, item.id_preps, locationId, displayOrder, qty, qty * price]
+            [id, item.id_preps, locationId, displayOrder, qty, qty * unitPrice]
           );
         } else {
           await connection.execute(
             `INSERT INTO inventory_items 
               (id_inventory, id_product, id_prep, item_type, id_location, display_order, quantity_type, quantity, wholesale_value)
              VALUES (?, ?, NULL, 'product', ?, ?, 'Each', ?, ?)`,
-            [id, item.id_products, locationId, displayOrder, qty, qty * price]
+            [id, item.id_products, locationId, displayOrder, qty, qty * unitPrice]
           );
         }
         displayOrder++;
