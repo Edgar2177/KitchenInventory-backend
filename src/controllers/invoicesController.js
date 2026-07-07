@@ -3,6 +3,21 @@ const { getRecipientsForType } = require('./notificationsController');
 const { sendInvoiceDiscrepancyEmail } = require('../services/emailService');
 
 // ============================================================
+// HELPERS — receipt_url / receipt_public_id guardan un JSON
+// array de varias fotos (ej: '["url1","url2"]'), o siguen siendo
+// una sola URL plana para invoices viejos (legacy, sin JSON).
+// ============================================================
+const parseJsonArray = (raw) => {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [raw];
+  } catch {
+    return [raw]; // legacy: ya era un valor plano, no JSON
+  }
+};
+
+// ============================================================
 // GET ORDER DATES FOR INVOICE SELECTOR (dropdown de fechas)
 // ============================================================
 const getOrderDatesForInvoice = async (req, res) => {
@@ -353,7 +368,10 @@ const saveInvoice = async (req, res) => {
     const quantityDiscrepancies = [];
 
     for (const item of items) {
-      const receivedQty  = item.received_qty  != null && item.received_qty  !== '' ? parseFloat(item.received_qty)  : null;
+      // ── FIX: si el usuario deja "Received" vacío, se interpreta
+      // como 0 (igual que el placeholder que ve en pantalla), en vez
+      // de guardarse como null y no contar para nada.
+      const receivedQty  = item.received_qty  != null && item.received_qty  !== '' ? parseFloat(item.received_qty)  : 0;
       const priceInvoice = item.price_invoice != null && item.price_invoice !== '' ? parseFloat(item.price_invoice) : null;
       const priceApp     = parseFloat(item.price_app)   || 0;
       const orderedQty   = parseFloat(item.ordered_qty) || 0;
@@ -391,7 +409,7 @@ const saveInvoice = async (req, res) => {
         });
       }
 
-      if (!noOrder && !item.is_extra && receivedQty !== null && Math.abs(receivedQty - orderedQty) > 0.001) {
+      if (!noOrder && !item.is_extra && Math.abs(receivedQty - orderedQty) > 0.001) {
         quantityDiscrepancies.push({
           product_name: item.product_name,
           product_code: item.product_code,
@@ -567,31 +585,88 @@ const getProductsForStore = async (req, res) => {
 };
 
 // ============================================================
-// UPLOAD RECEIPT IMAGE
+// UPLOAD RECEIPT IMAGES (múltiples, campo 'receipts' en el form)
 // ============================================================
 const uploadReceipt = async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No image provided' });
+    const files = req.files || [];
+    if (files.length === 0) {
+      return res.status(400).json({ success: false, message: 'No image provided' });
+    }
 
-    const { invoiceId, orderId, storeId } = req.body;
+    const { orderId, storeId } = req.body;
     if (!storeId) return res.status(400).json({ success: false, message: 'storeId is required' });
 
     const { uploadReceiptImage } = require('../services/cloudinaryService');
     const timestamp = Date.now();
-    const filename  = `receipt_store${storeId}_order${orderId || 'noorder'}_${timestamp}`;
-    const result    = await uploadReceiptImage(req.file.buffer, filename);
 
-    if (invoiceId) {
-      await pool.execute(
-        'UPDATE invoices SET receipt_url = ?, receipt_public_id = ? WHERE id_invoice = ?',
-        [result.secure_url, result.public_id, invoiceId]
-      );
+    const uploadedImages = [];
+    for (let i = 0; i < files.length; i++) {
+      const filename = `receipt_store${storeId}_order${orderId || 'noorder'}_${timestamp}_${i}`;
+      const result = await uploadReceiptImage(files[i].buffer, filename);
+      uploadedImages.push({ url: result.secure_url, public_id: result.public_id });
     }
 
-    res.json({ success: true, message: 'Receipt uploaded successfully', data: { url: result.secure_url, public_id: result.public_id } });
+    // Nota: NO se actualiza la tabla invoices aquí. El frontend mantiene
+    // el arreglo completo de fotos en memoria (existentes + nuevas) y lo
+    // persiste al hacer Save / Save & Send. Así evitamos que una foto
+    // subida "a medias" quede huérfana en BD si el usuario nunca guarda.
+    res.json({
+      success: true,
+      message: 'Receipt(s) uploaded successfully',
+      data: { images: uploadedImages }
+    });
   } catch (error) {
     console.error('Error uploading receipt:', error);
     res.status(500).json({ success: false, message: 'Error uploading receipt', error: error.message });
+  }
+};
+
+// ============================================================
+// REMOVE RECEIPT IMAGE — borra de Cloudinary y, si el invoice
+// ya existe en BD, también quita esa foto del JSON guardado.
+// ============================================================
+const removeReceipt = async (req, res) => {
+  try {
+    const { invoiceId, publicId, storeId } = req.body;
+    if (!publicId || !storeId) {
+      return res.status(400).json({ success: false, message: 'publicId and storeId are required' });
+    }
+
+    const { deleteReceiptImage } = require('../services/cloudinaryService');
+    // Best-effort: si falla el borrado en Cloudinary (ej. ya no existe),
+    // igual seguimos para no dejar la referencia huérfana en la BD.
+    await deleteReceiptImage(publicId);
+
+    if (invoiceId) {
+      const [[invoice]] = await pool.execute(
+        'SELECT receipt_url, receipt_public_id FROM invoices WHERE id_invoice = ? AND id_store = ?',
+        [invoiceId, storeId]
+      );
+
+      if (invoice) {
+        const urls = parseJsonArray(invoice.receipt_url);
+        const ids  = parseJsonArray(invoice.receipt_public_id);
+
+        // Filtramos por posición, no por valor, para no desalinear
+        // urls/ids si hubiera public_ids duplicados o nulos (legacy).
+        const keepIndexes = [];
+        ids.forEach((id, i) => { if (id !== publicId) keepIndexes.push(i); });
+
+        const newUrls = urls.filter((_, i) => keepIndexes.includes(i));
+        const newIds  = ids.filter((_, i) => keepIndexes.includes(i));
+
+        await pool.execute(
+          'UPDATE invoices SET receipt_url = ?, receipt_public_id = ?, updated_at = NOW() WHERE id_invoice = ?',
+          [JSON.stringify(newUrls), JSON.stringify(newIds), invoiceId]
+        );
+      }
+    }
+
+    res.json({ success: true, message: 'Receipt image removed successfully' });
+  } catch (error) {
+    console.error('Error removing receipt image:', error);
+    res.status(500).json({ success: false, message: 'Error removing receipt image', error: error.message });
   }
 };
 
@@ -674,6 +749,7 @@ module.exports = {
   getAllInvoices,
   getProductsForStore,
   uploadReceipt,
+  removeReceipt,
   getVendorsForStore,
   deleteInvoice
 };

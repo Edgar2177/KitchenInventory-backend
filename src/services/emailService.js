@@ -43,6 +43,24 @@ const formatCurrency = (v) =>
   v !== null && v !== undefined ? `$${parseFloat(v).toFixed(2)}` : '—';
 
 // ============================================================
+// Normaliza receipt_url a un arreglo de URLs.
+// Acepta 3 formatos posibles (ver Invoices module):
+//  - null / vacío            → sin fotos
+//  - JSON array stringified  → ["url1","url2",...] (formato nuevo, múltiples fotos)
+//  - string plano             → una sola URL (formato legacy)
+// ============================================================
+const parseReceiptUrls = (raw) => {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter(Boolean);
+    return parsed ? [String(parsed)] : [];
+  } catch {
+    return [raw]; // legacy: ya era una URL plana, no JSON
+  }
+};
+
+// ============================================================
 // Generar HTML para el email de orden
 // ============================================================
 const generateOrderEmailHTML = (orderData) => {
@@ -207,7 +225,7 @@ const sendInvoiceDiscrepancyEmail = async ({
   discrepancies    = [],
   price_discrepancies = [],
   invoice_number   = null,
-  receipt_url      = null,
+  receipt_url      = null,  // ← puede ser: null, una URL plana (legacy), o un JSON array stringified de varias URLs
   total_amount     = null,
   no_order         = false,
   items            = []
@@ -317,12 +335,26 @@ const sendInvoiceDiscrepancyEmail = async ({
     </table>
   ` : '';
 
-  // ── Sección: foto del recibo ──────────────────────────────
-  const receiptSection = receipt_url ? `
+  // ── Sección: fotos del recibo (soporta múltiples) ─────────
+  // Usamos display:inline-block en vez de flex/grid porque tiene
+  // mejor soporte en clientes de correo (Outlook, etc).
+  const receiptUrls = parseReceiptUrls(receipt_url);
+  const isMultiple   = receiptUrls.length > 1;
+
+  const receiptSection = receiptUrls.length > 0 ? `
     <div style="margin-top:20px;padding-top:16px;border-top:1px solid #e2e8f0;">
-      <p style="font-size:12px;font-weight:600;color:#475569;margin:0 0 8px;">📷 Receipt Photo:</p>
-      <img src="${receipt_url}" alt="Receipt"
-        style="max-width:100%;border-radius:8px;border:1px solid #e2e8f0;display:block;" />
+      <p style="font-size:12px;font-weight:600;color:#475569;margin:0 0 8px;">
+        📷 Receipt Photo${isMultiple ? `s (${receiptUrls.length})` : ''}:
+      </p>
+      <div style="font-size:0;">
+        ${receiptUrls.map((url, idx) => `
+          <img src="${url}" alt="Receipt ${idx + 1}"
+            style="width:${isMultiple ? '160px' : '100%'};max-width:100%;height:auto;
+                   border-radius:8px;border:1px solid #e2e8f0;
+                   display:inline-block;vertical-align:top;object-fit:cover;
+                   margin:0 8px 8px 0;" />
+        `).join('')}
+      </div>
     </div>
   ` : '';
 

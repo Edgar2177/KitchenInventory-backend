@@ -11,11 +11,12 @@ const {
   getAllInvoices,
   getProductsForStore,
   uploadReceipt,
+  removeReceipt,
   getVendorsForStore,
   deleteInvoice
 } = require('../controllers/invoicesController');
 
-// Multer — almacenar en memoria (buffer), límite 10MB
+// Multer — almacenar en memoria (buffer), límite 10MB por archivo
 const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 10 * 1024 * 1024 },
@@ -46,8 +47,11 @@ router.get('/products', getProductsForStore);
 // POST /api/invoices/save
 router.post('/save', saveInvoice);
 
-// POST /api/invoices/upload-receipt  (multipart/form-data, campo: receipt)
-router.post('/upload-receipt', upload.single('receipt'), uploadReceipt);
+// POST /api/invoices/upload-receipt  (multipart/form-data, campo: receipts, hasta 10 fotos)
+router.post('/upload-receipt', upload.array('receipts', 10), uploadReceipt);
+
+// POST /api/invoices/remove-receipt  (body: { invoiceId, publicId, storeId })
+router.post('/remove-receipt', removeReceipt);
 
 router.get('/vendors', getVendorsForStore);
 
