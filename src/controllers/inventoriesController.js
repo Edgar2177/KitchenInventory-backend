@@ -5,17 +5,20 @@ const XLSX = require('xlsx');
 // FUNCIONES AUXILIARES
 // ========================================
 
+// Devuelve el id del inventario ABIERTO más reciente de una location
+// (cualquier estado distinto de 'Locked'), o null si no hay ninguno.
 const checkActiveInventory = async (locationId, excludeInventoryId = null) => {
   let query = `
-    SELECT id_inventories 
-    FROM inventories 
-    WHERE id_location = ? AND (status = 'Unlocked' OR status = 'Unlocked')
+    SELECT id_inventories
+    FROM inventories
+    WHERE id_location = ? AND status != 'Locked'
   `;
   const params = [locationId];
   if (excludeInventoryId) {
     query += ' AND id_inventories != ?';
     params.push(excludeInventoryId);
   }
+  query += ' ORDER BY id_inventories DESC LIMIT 1';
   const [result] = await pool.execute(query, params);
   return result.length > 0 ? result[0].id_inventories : null;
 };
@@ -369,12 +372,19 @@ const createInventory = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Location is required' });
     }
 
-    if (status === 'Locked') {
-      const activeInventoryId = await checkActiveInventory(locationId);
-      if (activeInventoryId) {
-        await connection.rollback();
-        return res.status(400).json({ success: false, message: 'There is already an active inventory for this location.' });
-      }
+    // Regla de negocio: una location no puede tener más de un inventario abierto
+    // (no cerrado) a la vez. Esta verificación aplica a CUALQUIER creación nueva
+    // —borrador o cierre— para evitar inventarios duplicados de la misma fecha.
+    // Para continuar un inventario existente se usa updateInventory, no este endpoint.
+    const activeInventoryId = await checkActiveInventory(locationId);
+    if (activeInventoryId) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        code: 'ACTIVE_INVENTORY_EXISTS',
+        activeInventoryId,
+        message: 'There is already an open inventory for this location. Please continue or close it before creating a new one.'
+      });
     }
 
     let finalItems = [];
