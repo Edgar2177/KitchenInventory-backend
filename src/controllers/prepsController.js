@@ -37,6 +37,7 @@ const getAllPreps = async (req, res) => {
         p.yield_quantity                  AS yieldQuantity,
         p.yield_unit                      AS yieldUnit,
         p.yield_unit_cost                 AS yieldUnitCost,
+        p.show_in_physical_inventory      AS showInPhysicalInventory,
         p.created_at                      AS createdAt,
         COUNT(pi.id_prep_ingredient)      AS ingredientCount,
         ANY_VALUE(main_ing.main_name)     AS mainIngredientName,
@@ -76,14 +77,15 @@ const getPrepById = async (req, res) => {
 
     const [preps] = await pool.execute(`
       SELECT
-        id_preps        AS id,
-        id_store        AS storeId,
-        prep_name       AS name,
-        total_cost      AS totalCost,
-        yield_quantity  AS yieldQuantity,
-        yield_unit      AS yieldUnit,
-        yield_unit_cost AS yieldUnitCost,
-        created_at      AS createdAt
+        id_preps                     AS id,
+        id_store                     AS storeId,
+        prep_name                    AS name,
+        total_cost                   AS totalCost,
+        yield_quantity                AS yieldQuantity,
+        yield_unit                   AS yieldUnit,
+        yield_unit_cost              AS yieldUnitCost,
+        show_in_physical_inventory   AS showInPhysicalInventory,
+        created_at                   AS createdAt
       FROM preps WHERE id_preps = ?`, [id]
     );
 
@@ -142,7 +144,10 @@ const createPrep = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { storeId, name, ingredients = [], subPreps = [], yieldQuantity, yieldUnit } = req.body;
+    const {
+      storeId, name, ingredients = [], subPreps = [], yieldQuantity, yieldUnit,
+      showInPhysicalInventory
+    } = req.body;
 
     if (!storeId) {
       await connection.rollback();
@@ -176,11 +181,14 @@ const createPrep = async (req, res) => {
       ? totalCost / parseFloat(yieldQuantity)
       : null;
 
+    // showInPhysicalInventory: default true si no viene definido explícitamente
+    const showInPI = showInPhysicalInventory === false ? 0 : 1;
+
     // Insertar prep
     const [result] = await connection.execute(
-      `INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost]
+      `INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost, show_in_physical_inventory)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI]
     );
     const prepId = result.insertId;
 
@@ -238,7 +246,10 @@ const updatePrep = async (req, res) => {
     await connection.beginTransaction();
 
     const { id } = req.params;
-    const { name, ingredients = [], subPreps = [], yieldQuantity, yieldUnit } = req.body;
+    const {
+      name, ingredients = [], subPreps = [], yieldQuantity, yieldUnit,
+      showInPhysicalInventory
+    } = req.body;
 
     if (!name?.trim()) {
       await connection.rollback();
@@ -277,13 +288,16 @@ const updatePrep = async (req, res) => {
       ? totalCost / parseFloat(yieldQuantity)
       : null;
 
+    // showInPhysicalInventory: default true si no viene definido explícitamente
+    const showInPI = showInPhysicalInventory === false ? 0 : 1;
+
     // Actualizar prep
     await connection.execute(
       `UPDATE preps
        SET prep_name = ?, total_cost = ?, yield_quantity = ?, yield_unit = ?,
-           yield_unit_cost = ?, updated_at = CURRENT_TIMESTAMP
+           yield_unit_cost = ?, show_in_physical_inventory = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id_preps = ?`,
-      [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, id]
+      [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI, id]
     );
 
     // Limpiar ingredientes anteriores

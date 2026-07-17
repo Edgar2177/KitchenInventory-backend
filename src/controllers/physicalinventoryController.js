@@ -117,7 +117,9 @@ const getPhysicalInventoryById = async (req, res) => {
       [storeId]
     );
 
-    // 2. Todos los preps del store
+    // 2. Todos los preps del store QUE SE MARCARON PARA CONTARSE en Physical
+    //    Inventory (show_in_physical_inventory = 1). Los que el usuario marcó
+    //    como "no mostrar" simplemente no entran a esta lista.
     const [allPreps] = await pool.execute(
       `SELECT 
         pr.id_preps,
@@ -130,6 +132,7 @@ const getPhysicalInventoryById = async (req, res) => {
         0 as wholesale_price
        FROM preps pr
        WHERE pr.id_store = ?
+         AND pr.show_in_physical_inventory = 1
        ORDER BY pr.prep_name ASC`,
       [storeId]
     );
@@ -252,7 +255,7 @@ const getPhysicalInventoryById = async (req, res) => {
       display_order:     i + 1
     }));
 
-    // 7. Combinar preps
+    // 7. Combinar preps (solo los que ya vienen filtrados por show_in_physical_inventory = 1)
     const prepItems = allPreps.map((p, i) => ({
       id_product:        null,
       id_preps:          p.id_preps,
@@ -347,7 +350,8 @@ const getProductsForPhysicalInventory = async (req, res) => {
         }
       }
 
-    // Todos los preps del store
+    // Todos los preps del store QUE SE MARCARON PARA CONTARSE en Physical
+    // Inventory (show_in_physical_inventory = 1).
     const [preps] = await pool.execute(
       `SELECT 
         pr.id_preps,
@@ -361,6 +365,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
         0 as wholesale_price
        FROM preps pr
        WHERE pr.id_store = ?
+         AND pr.show_in_physical_inventory = 1
        ORDER BY pr.prep_name ASC`,
       [storeId]
     );
