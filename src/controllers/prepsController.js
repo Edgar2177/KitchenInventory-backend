@@ -70,6 +70,8 @@ const getAllPreps = async (req, res) => {
 
 // ============================================================
 // GET PREP BY ID — incluye ingredientes y sub-preps con isMain
+// ORDER BY display_order en vez de nombre alfabético, para
+// respetar el orden manual definido por el usuario (drag & drop).
 // ============================================================
 const getPrepById = async (req, res) => {
   try {
@@ -85,6 +87,7 @@ const getPrepById = async (req, res) => {
         yield_unit                   AS yieldUnit,
         yield_unit_cost              AS yieldUnitCost,
         show_in_physical_inventory   AS showInPhysicalInventory,
+        instructions                 AS instructions,
         created_at                   AS createdAt
       FROM preps WHERE id_preps = ?`, [id]
     );
@@ -102,11 +105,12 @@ const getPrepById = async (req, res) => {
         pi.unit,
         pi.unit_cost          AS unitCost,
         pi.total_cost         AS totalCost,
-        pi.is_main            AS isMain
+        pi.is_main            AS isMain,
+        pi.display_order      AS displayOrder
       FROM prep_ingredients pi
       INNER JOIN products p ON pi.id_product = p.id_products
       WHERE pi.id_prep = ? AND pi.item_type = 'product'
-      ORDER BY p.product_name`, [id]
+      ORDER BY pi.display_order ASC, p.product_name ASC`, [id]
     );
 
     // Sub-preps tipo prep
@@ -122,11 +126,12 @@ const getPrepById = async (req, res) => {
         pi.unit,
         pi.unit_cost          AS unitCost,
         pi.total_cost         AS totalCost,
-        pi.is_main            AS isMain
+        pi.is_main            AS isMain,
+        pi.display_order      AS displayOrder
       FROM prep_ingredients pi
       INNER JOIN preps pr ON pi.id_prep_ref = pr.id_preps
       WHERE pi.id_prep = ? AND pi.item_type = 'prep'
-      ORDER BY pr.prep_name`, [id]
+      ORDER BY pi.display_order ASC, pr.prep_name ASC`, [id]
     );
 
     res.json({ success: true, data: { ...preps[0], ingredients, subPreps } });
@@ -138,6 +143,10 @@ const getPrepById = async (req, res) => {
 
 // ============================================================
 // CREATE PREP
+// El orden en el que llegan los arrays "ingredients" y "subPreps"
+// (ya definido por el usuario en el frontend, vía drag & drop o
+// flechas ↑/↓) es lo que se persiste en display_order — el índice
+// dentro de cada array ES la posición a guardar.
 // ============================================================
 const createPrep = async (req, res) => {
   const connection = await pool.getConnection();
@@ -146,7 +155,7 @@ const createPrep = async (req, res) => {
 
     const {
       storeId, name, ingredients = [], subPreps = [], yieldQuantity, yieldUnit,
-      showInPhysicalInventory
+      showInPhysicalInventory, instructions
     } = req.body;
 
     if (!storeId) {
@@ -183,27 +192,30 @@ const createPrep = async (req, res) => {
 
     // showInPhysicalInventory: default true si no viene definido explícitamente
     const showInPI = showInPhysicalInventory === false ? 0 : 1;
+    const instructionsValue = instructions && instructions.trim() ? instructions.trim() : null;
 
     // Insertar prep
     const [result] = await connection.execute(
-      `INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost, show_in_physical_inventory)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI]
+      `INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost, show_in_physical_inventory, instructions)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI, instructionsValue]
     );
     const prepId = result.insertId;
 
-    // Insertar ingredientes (productos)
-    for (const ing of ingredients) {
+    // Insertar ingredientes (productos) — display_order = posición en el array (1-indexed)
+    for (let i = 0; i < ingredients.length; i++) {
+      const ing = ingredients[i];
       await connection.execute(
         `INSERT INTO prep_ingredients
-           (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main)
-         VALUES (?, ?, 'product', ?, ?, ?, ?, ?)`,
-        [prepId, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost, ing.isMain ? 1 : 0]
+           (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main, display_order)
+         VALUES (?, ?, 'product', ?, ?, ?, ?, ?, ?)`,
+        [prepId, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost, ing.isMain ? 1 : 0, i + 1]
       );
     }
 
-    // Insertar sub-preps
-    for (const sp of subPreps) {
+    // Insertar sub-preps — display_order = posición en el array (1-indexed)
+    for (let i = 0; i < subPreps.length; i++) {
+      const sp = subPreps[i];
       // Verificar ciclo: el sub-prep no puede contener este prep
       const descendants = await getDescendantPrepIds(sp.prepId);
       if (descendants.has(prepId)) {
@@ -220,9 +232,9 @@ const createPrep = async (req, res) => {
 
       await connection.execute(
         `INSERT INTO prep_ingredients
-           (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost, is_main)
-         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?)`,
-        [prepId, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost, sp.isMain ? 1 : 0]
+           (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost, is_main, display_order)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?, ?)`,
+        [prepId, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost, sp.isMain ? 1 : 0, i + 1]
       );
     }
 
@@ -239,6 +251,8 @@ const createPrep = async (req, res) => {
 
 // ============================================================
 // UPDATE PREP
+// Mismo criterio que createPrep: el índice de cada elemento
+// dentro de "ingredients" / "subPreps" define su display_order.
 // ============================================================
 const updatePrep = async (req, res) => {
   const connection = await pool.getConnection();
@@ -248,7 +262,7 @@ const updatePrep = async (req, res) => {
     const { id } = req.params;
     const {
       name, ingredients = [], subPreps = [], yieldQuantity, yieldUnit,
-      showInPhysicalInventory
+      showInPhysicalInventory, instructions
     } = req.body;
 
     if (!name?.trim()) {
@@ -290,31 +304,34 @@ const updatePrep = async (req, res) => {
 
     // showInPhysicalInventory: default true si no viene definido explícitamente
     const showInPI = showInPhysicalInventory === false ? 0 : 1;
+    const instructionsValue = instructions && instructions.trim() ? instructions.trim() : null;
 
     // Actualizar prep
     await connection.execute(
       `UPDATE preps
        SET prep_name = ?, total_cost = ?, yield_quantity = ?, yield_unit = ?,
-           yield_unit_cost = ?, show_in_physical_inventory = ?, updated_at = CURRENT_TIMESTAMP
+           yield_unit_cost = ?, show_in_physical_inventory = ?, instructions = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id_preps = ?`,
-      [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI, id]
+      [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI, instructionsValue, id]
     );
 
     // Limpiar ingredientes anteriores
     await connection.execute('DELETE FROM prep_ingredients WHERE id_prep = ?', [id]);
 
-    // Insertar ingredientes (productos)
-    for (const ing of ingredients) {
+    // Insertar ingredientes (productos) — display_order = posición en el array (1-indexed)
+    for (let i = 0; i < ingredients.length; i++) {
+      const ing = ingredients[i];
       await connection.execute(
         `INSERT INTO prep_ingredients
-           (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main)
-         VALUES (?, ?, 'product', ?, ?, ?, ?, ?)`,
-        [id, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost, ing.isMain ? 1 : 0]
+           (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main, display_order)
+         VALUES (?, ?, 'product', ?, ?, ?, ?, ?, ?)`,
+        [id, ing.productId, ing.quantity, ing.unit, ing.unitCost, ing.totalCost, ing.isMain ? 1 : 0, i + 1]
       );
     }
 
-    // Insertar sub-preps
-    for (const sp of subPreps) {
+    // Insertar sub-preps — display_order = posición en el array (1-indexed)
+    for (let i = 0; i < subPreps.length; i++) {
+      const sp = subPreps[i];
       // No puede usar a sí mismo
       if (parseInt(sp.prepId) === parseInt(id)) {
         await connection.rollback();
@@ -337,9 +354,9 @@ const updatePrep = async (req, res) => {
 
       await connection.execute(
         `INSERT INTO prep_ingredients
-           (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost, is_main)
-         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?)`,
-        [id, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost, sp.isMain ? 1 : 0]
+           (id_prep, id_prep_ref, item_type, quantity, unit, unit_cost, total_cost, is_main, display_order)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?, ?)`,
+        [id, sp.prepId, sp.quantity, sp.unit || sp.baseUnit || 'Each', unitCost, sp.totalCost, sp.isMain ? 1 : 0, i + 1]
       );
     }
 
