@@ -96,7 +96,7 @@ const getPrepById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Preparation not found' });
 
     // Ingredientes tipo product
-    const [ingredients] = await pool.execute(`
+    const [ingredientRows] = await pool.execute(`
       SELECT
         pi.id_prep_ingredient AS id,
         pi.id_product         AS productId,
@@ -112,6 +112,25 @@ const getPrepById = async (req, res) => {
       WHERE pi.id_prep = ? AND pi.item_type = 'product'
       ORDER BY pi.display_order ASC, p.product_name ASC`, [id]
     );
+
+    // Subtítulos de sección dentro de la lista de Ingredients (ej. "Cocido", "Crudo")
+    const [sectionRows] = await pool.execute(`
+      SELECT
+        pi.id_prep_ingredient AS id,
+        pi.section_label      AS sectionLabel,
+        pi.display_order      AS displayOrder
+      FROM prep_ingredients pi
+      WHERE pi.id_prep = ? AND pi.item_type = 'section'
+      ORDER BY pi.display_order ASC`, [id]
+    );
+
+    // Combinar productos + secciones en una sola lista ordenada por
+    // display_order, para que el frontend renderice ambos tipos de
+    // fila intercalados tal como el usuario los acomodó.
+    const ingredients = [
+      ...ingredientRows.map(r => ({ ...r, itemType: 'product' })),
+      ...sectionRows.map(r => ({ ...r, itemType: 'section' }))
+    ].sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0));
 
     // Sub-preps tipo prep
     const [subPreps] = await pool.execute(`
@@ -166,7 +185,8 @@ const createPrep = async (req, res) => {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'Preparation name is required' });
     }
-    if (ingredients.length === 0 && subPreps.length === 0) {
+    const realIngredientsCount = ingredients.filter(ing => ing.itemType !== 'section').length;
+    if (realIngredientsCount === 0 && subPreps.length === 0) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'At least one ingredient or sub-preparation is required' });
     }
@@ -202,9 +222,22 @@ const createPrep = async (req, res) => {
     );
     const prepId = result.insertId;
 
-    // Insertar ingredientes (productos) — display_order = posición en el array (1-indexed)
+    // Insertar ingredientes (productos) y subtítulos de sección —
+    // display_order = posición en el array (1-indexed). Ambos tipos
+    // conviven en el mismo array/orden, tal como lo armó el usuario.
     for (let i = 0; i < ingredients.length; i++) {
       const ing = ingredients[i];
+      if (ing.itemType === 'section') {
+        const label = (ing.sectionLabel || '').trim();
+        if (!label) continue; // no guardar secciones vacías sin capturar
+        await connection.execute(
+          `INSERT INTO prep_ingredients
+             (id_prep, item_type, section_label, quantity, unit, unit_cost, total_cost, is_main, display_order)
+           VALUES (?, 'section', ?, 0, '', 0, 0, 0, ?)`,
+          [prepId, label, i + 1]
+        );
+        continue;
+      }
       await connection.execute(
         `INSERT INTO prep_ingredients
            (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main, display_order)
@@ -269,7 +302,8 @@ const updatePrep = async (req, res) => {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'Preparation name is required' });
     }
-    if (ingredients.length === 0 && subPreps.length === 0) {
+    const realIngredientsCount = ingredients.filter(ing => ing.itemType !== 'section').length;
+    if (realIngredientsCount === 0 && subPreps.length === 0) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'At least one ingredient or sub-preparation is required' });
     }
@@ -318,9 +352,22 @@ const updatePrep = async (req, res) => {
     // Limpiar ingredientes anteriores
     await connection.execute('DELETE FROM prep_ingredients WHERE id_prep = ?', [id]);
 
-    // Insertar ingredientes (productos) — display_order = posición en el array (1-indexed)
+    // Insertar ingredientes (productos) y subtítulos de sección —
+    // display_order = posición en el array (1-indexed). Ambos tipos
+    // conviven en el mismo array/orden, tal como lo armó el usuario.
     for (let i = 0; i < ingredients.length; i++) {
       const ing = ingredients[i];
+      if (ing.itemType === 'section') {
+        const label = (ing.sectionLabel || '').trim();
+        if (!label) continue; // no guardar secciones vacías sin capturar
+        await connection.execute(
+          `INSERT INTO prep_ingredients
+             (id_prep, item_type, section_label, quantity, unit, unit_cost, total_cost, is_main, display_order)
+           VALUES (?, 'section', ?, 0, '', 0, 0, 0, ?)`,
+          [id, label, i + 1]
+        );
+        continue;
+      }
       await connection.execute(
         `INSERT INTO prep_ingredients
            (id_prep, id_product, item_type, quantity, unit, unit_cost, total_cost, is_main, display_order)
