@@ -1,15 +1,88 @@
 const pool = require('../config/database');
 
-// Obtener todas las recetas
+// ============================================================
+// HELPER: normalizar el payload a UNA sola lista ordenada "items".
+// El frontend nuevo manda body.items (productos, secciones y
+// preparations intercalados en el orden final). Si llega un frontend
+// viejo (ingredients + preparations), se reconstruye: primero
+// ingredients (productos), luego preparations — como se veía antes.
+// ============================================================
+const buildOrderedItems = (body) => {
+  if (Array.isArray(body.items) && body.items.length > 0) {
+    return body.items.map(it => ({ ...it }));
+  }
+  const ingredients  = Array.isArray(body.ingredients)  ? body.ingredients  : [];
+  const preparations = Array.isArray(body.preparations) ? body.preparations : [];
+  return [
+    ...ingredients.map(it => ({ ...it, itemType: it.itemType || 'product' })),
+    ...preparations.map(p => ({ ...p, itemType: 'prep' }))
+  ];
+};
+
+// ============================================================
+// HELPER: insertar la lista unificada en recipe_ingredients.
+// display_order = posición GLOBAL dentro del arreglo (1-indexed),
+// sin importar el tipo. Devuelve el costo total acumulado.
+// ============================================================
+const insertRecipeItems = async (connection, recipeId, items) => {
+  let totalCost = 0;
+  let position  = 0;
+
+  for (const raw of items) {
+    const it = raw || {};
+
+    if (it.itemType === 'section') {
+      const label = (it.sectionLabel || '').trim();
+      if (!label) continue; // no guardar secciones vacías
+      position += 1;
+      await connection.execute(
+        `INSERT INTO recipe_ingredients
+           (id_recipe, item_type, section_label, quantity, unit, unit_cost, total_cost, display_order)
+         VALUES (?, 'section', ?, 0, '', 0, 0, ?)`,
+        [recipeId, label, position]
+      );
+      continue;
+    }
+
+    if (it.itemType === 'prep') {
+      const unitCost = parseFloat(it.quantity) > 0
+        ? (parseFloat(it.totalCost) / parseFloat(it.quantity)).toFixed(6)
+        : 0;
+      position += 1;
+      totalCost += parseFloat(it.totalCost) || 0;
+      await connection.execute(
+        `INSERT INTO recipe_ingredients
+           (id_recipe, id_prep, item_type, quantity, unit, unit_cost, total_cost, display_order)
+         VALUES (?, ?, 'prep', ?, ?, ?, ?, ?)`,
+        [recipeId, it.prepId, it.quantity, it.unit || 'Each', unitCost, it.totalCost, position]
+      );
+      continue;
+    }
+
+    // itemType === 'product' (default)
+    position += 1;
+    totalCost += parseFloat(it.totalCost) || 0;
+    await connection.execute(
+      `INSERT INTO recipe_ingredients
+         (id_recipe, id_product, item_type, quantity, unit, unit_cost, total_cost, display_order)
+       VALUES (?, ?, 'product', ?, ?, ?, ?, ?)`,
+      [recipeId, it.productId, it.quantity, it.unit, it.unitCost, it.totalCost, position]
+    );
+  }
+
+  return totalCost;
+};
+
+// ============================================================
+// GET ALL RECIPES
+// ingredientCount excluye las filas de sección (subtítulos).
+// ============================================================
 const getAllRecipes = async (req, res) => {
   try {
     const { storeId } = req.query;
 
     if (!storeId) {
-      return res.status(400).json({
-        success: false,
-        message: 'storeId is required'
-      });
+      return res.status(400).json({ success: false, message: 'storeId is required' });
     }
 
     const [recipes] = await pool.execute(`
@@ -19,7 +92,7 @@ const getAllRecipes = async (req, res) => {
         r.recipe_name as name,
         r.total_cost as totalCost,
         r.created_at as createdAt,
-        COUNT(ri.id_recipe_ingredient) as ingredientCount
+        COUNT(CASE WHEN ri.item_type IN ('product','prep') THEN ri.id_recipe_ingredient END) as ingredientCount
       FROM recipes r 
       LEFT JOIN recipe_ingredients ri 
         ON r.id_recipes = ri.id_recipe
@@ -28,34 +101,31 @@ const getAllRecipes = async (req, res) => {
       ORDER BY r.recipe_name
     `, [storeId]);
 
-    res.json({
-      success: true,
-      data: recipes
-    });
+    res.json({ success: true, data: recipes });
   } catch (error) {
     console.error('Error fetching recipes:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching recipes',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error fetching recipes', error: error.message });
   }
 };
 
-// Obtener una receta por ID con sus ingredientes y preparations
+// ============================================================
+// GET RECIPE BY ID
+// Devuelve un ÚNICO arreglo "items" (product + section + prep)
+// ordenado por display_order GLOBAL. Con detección de datos legacy:
+// si hay display_order duplicados dentro de la receta (recetas
+// viejas sin orden, todas NULL/0), usa el orden clásico
+// (ingredients por nombre, luego preparations por nombre).
+// Se siguen devolviendo ingredients y preparations por compat.
+// ============================================================
 const getRecipeById = async (req, res) => {
   try {
     const { id } = req.params;
     const { storeId } = req.query;
 
     if (!storeId) {
-      return res.status(400).json({
-        success: false,
-        message: 'storeId is required'
-      });
+      return res.status(400).json({ success: false, message: 'storeId is required' });
     }
 
-    // Obtener receta
     const [recipes] = await pool.execute(`
       SELECT 
         id_recipes as id,
@@ -68,14 +138,11 @@ const getRecipeById = async (req, res) => {
     `, [id, storeId]);
 
     if (recipes.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Recipe not found'
-      });
+      return res.status(404).json({ success: false, message: 'Recipe not found' });
     }
 
-    // Obtener ingredientes (solo productos)
-    const [ingredients] = await pool.execute(`
+    // Ingredientes (productos) — ordenados por display_order y nombre
+    const [ingredientRows] = await pool.execute(`
       SELECT 
         ri.id_recipe_ingredient as id,
         ri.id_product as productId,
@@ -83,15 +150,27 @@ const getRecipeById = async (req, res) => {
         ri.quantity,
         ri.unit,
         ri.unit_cost as unitCost,
-        ri.total_cost as totalCost
+        ri.total_cost as totalCost,
+        ri.display_order as displayOrder
       FROM recipe_ingredients ri
       INNER JOIN products p ON ri.id_product = p.id_products
       WHERE ri.id_recipe = ? AND ri.item_type = 'product'
-      ORDER BY p.product_name
+      ORDER BY ri.display_order ASC, p.product_name ASC
     `, [id]);
 
-    // Obtener preparations (pre-batch)
-    const [preparations] = await pool.execute(`
+    // Subtítulos de sección
+    const [sectionRows] = await pool.execute(`
+      SELECT 
+        ri.id_recipe_ingredient as id,
+        ri.section_label as sectionLabel,
+        ri.display_order as displayOrder
+      FROM recipe_ingredients ri
+      WHERE ri.id_recipe = ? AND ri.item_type = 'section'
+      ORDER BY ri.display_order ASC
+    `, [id]);
+
+    // Preparations (pre-batch) — ordenadas por display_order y nombre
+    const [prepRows] = await pool.execute(`
       SELECT 
         ri.id_recipe_ingredient as id,
         ri.id_prep as prepId,
@@ -102,157 +181,115 @@ const getRecipeById = async (req, res) => {
         ri.quantity,
         ri.unit,
         ri.unit_cost as unitCost,
-        ri.total_cost as totalCost
+        ri.total_cost as totalCost,
+        ri.display_order as displayOrder
       FROM recipe_ingredients ri
       INNER JOIN preps pr ON ri.id_prep = pr.id_preps
       WHERE ri.id_recipe = ? AND ri.item_type = 'prep'
-      ORDER BY pr.prep_name
+      ORDER BY ri.display_order ASC, pr.prep_name ASC
     `, [id]);
 
-    const recipe = {
-      ...recipes[0],
-      ingredients,
-      preparations
-    };
+    const products = ingredientRows.map(r => ({ ...r, itemType: 'product' }));
+    const sections = sectionRows.map(r => ({ ...r, itemType: 'section' }));
+    const preps    = prepRows.map(r => ({ ...r, itemType: 'prep' }));
 
-    res.json({
-      success: true,
-      data: recipe
-    });
+    const byOrder = (a, b) =>
+      (a.displayOrder ?? 0) - (b.displayOrder ?? 0) || (a.id ?? 0) - (b.id ?? 0);
+
+    // ── Detección legacy: display_order duplicado dentro de la receta ──
+    const allRows  = [...products, ...sections, ...preps];
+    const orders   = allRows.map(r => r.displayOrder ?? 0);
+    const isLegacy = new Set(orders).size !== orders.length;
+
+    let items;
+    if (isLegacy) {
+      // Orden clásico: product/section primero (ya vienen por nombre), luego prep
+      items = [
+        ...[...products, ...sections].sort(byOrder),
+        ...[...preps].sort(byOrder)
+      ];
+    } else {
+      items = allRows.sort(byOrder);
+    }
+
+    // Compat: derivar ingredients (product+section) y preparations
+    const ingredients  = items.filter(it => it.itemType === 'product' || it.itemType === 'section');
+    const preparations = items.filter(it => it.itemType === 'prep');
+
+    res.json({ success: true, data: { ...recipes[0], items, ingredients, preparations } });
   } catch (error) {
     console.error('Error fetching recipe:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching recipe',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error fetching recipe', error: error.message });
   }
 };
 
-// Crear receta
+// ============================================================
+// CREATE RECIPE
+// El índice global de cada elemento dentro de "items" define su
+// display_order (orden definido por el usuario vía drag & drop
+// o flechas ↑/↓).
+// ============================================================
 const createRecipe = async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
     await connection.beginTransaction();
 
-    const { storeId, posIdNumber, name, ingredients, preparations } = req.body;
+    const { storeId, posIdNumber, name } = req.body;
+    const items = buildOrderedItems(req.body);
 
-    // Validaciones
     if (!storeId) {
       await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'storeId is required'
-      });
+      return res.status(400).json({ success: false, message: 'storeId is required' });
     }
-
     if (!name || !name.trim()) {
       await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'Recipe name is required'
-      });
+      return res.status(400).json({ success: false, message: 'Recipe name is required' });
     }
 
-    const hasIngredients   = ingredients   && ingredients.length   > 0;
-    const hasPreparations  = preparations  && preparations.length  > 0;
-
-    if (!hasIngredients && !hasPreparations) {
+    const realItemsCount = items.filter(it => it.itemType === 'product' || it.itemType === 'prep').length;
+    if (realItemsCount === 0) {
       await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'At least one ingredient or preparation is required'
-      });
+      return res.status(400).json({ success: false, message: 'At least one ingredient or preparation is required' });
     }
 
-    // Verificar nombre único
+    // Nombre único
     const [existing] = await connection.execute(
       'SELECT id_recipes FROM recipes WHERE id_stores = ? AND LOWER(TRIM(recipe_name)) = LOWER(TRIM(?))',
       [storeId, name]
     );
-
     if (existing.length > 0) {
       await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: 'A recipe with that name already exists'
-      });
+      return res.status(409).json({ success: false, message: 'A recipe with that name already exists' });
     }
 
-    // Calcular costo total (ingredientes + preparations)
+    // Costo total
     let totalCost = 0;
-    (ingredients  || []).forEach(ing  => { totalCost += parseFloat(ing.totalCost)  || 0; });
-    (preparations || []).forEach(prep => { totalCost += parseFloat(prep.totalCost) || 0; });
+    items.forEach(it => { if (it.itemType === 'product' || it.itemType === 'prep') totalCost += parseFloat(it.totalCost) || 0; });
 
-    // Insertar receta
     const [result] = await connection.execute(
       `INSERT INTO recipes (id_stores, pos_id_number, recipe_name, total_cost) 
        VALUES (?, ?, ?, ?)`,
       [storeId, posIdNumber || null, name.trim(), totalCost]
     );
-
     const recipeId = result.insertId;
 
-    // Insertar ingredientes (productos)
-    for (const ingredient of (ingredients || [])) {
-      await connection.execute(
-        `INSERT INTO recipe_ingredients 
-         (id_recipe, id_product, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'product', ?, ?, ?, ?)`,
-        [
-          recipeId,
-          ingredient.productId,
-          ingredient.quantity,
-          ingredient.unit,
-          ingredient.unitCost,
-          ingredient.totalCost
-        ]
-      );
-    }
-
-    // Insertar preparations (pre-batch)
-    for (const prep of (preparations || [])) {
-      const unitCost = parseFloat(prep.quantity) > 0
-        ? (parseFloat(prep.totalCost) / parseFloat(prep.quantity)).toFixed(6)
-        : 0;
-
-      await connection.execute(
-        `INSERT INTO recipe_ingredients 
-         (id_recipe, id_prep, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'prep', ?, ?, ?, ?)`,
-        [
-          recipeId,
-          prep.prepId,
-          prep.quantity,
-          prep.unit || 'Each',
-          unitCost,
-          prep.totalCost
-        ]
-      );
-    }
+    await insertRecipeItems(connection, recipeId, items);
 
     await connection.commit();
-
-    res.status(201).json({
-      success: true,
-      message: 'Recipe created successfully',
-      data: { id: recipeId }
-    });
+    res.status(201).json({ success: true, message: 'Recipe created successfully', data: { id: recipeId } });
   } catch (error) {
     await connection.rollback();
     console.error('Error creating recipe:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error creating recipe',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error creating recipe', error: error.message });
   } finally {
     connection.release();
   }
 };
 
-// Actualizar receta
+// ============================================================
+// UPDATE RECIPE
+// ============================================================
 const updateRecipe = async (req, res) => {
   const connection = await pool.getConnection();
 
@@ -260,63 +297,42 @@ const updateRecipe = async (req, res) => {
     await connection.beginTransaction();
 
     const { id } = req.params;
-    // FIX: storeId ahora se extrae del body
-    const { storeId, posIdNumber, name, ingredients, preparations } = req.body;
+    const { posIdNumber, name } = req.body;
+    const items = buildOrderedItems(req.body);
 
-    // Validaciones
     if (!name || !name.trim()) {
       await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'Recipe name is required'
-      });
+      return res.status(400).json({ success: false, message: 'Recipe name is required' });
     }
 
-    const hasIngredients  = ingredients  && ingredients.length  > 0;
-    const hasPreparations = preparations && preparations.length > 0;
-
-    if (!hasIngredients && !hasPreparations) {
+    const realItemsCount = items.filter(it => it.itemType === 'product' || it.itemType === 'prep').length;
+    if (realItemsCount === 0) {
       await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'At least one ingredient or preparation is required'
-      });
+      return res.status(400).json({ success: false, message: 'At least one ingredient or preparation is required' });
     }
 
-    // FIX: verificar que la receta existe (query correcta)
     const [existing] = await connection.execute(
       'SELECT id_stores FROM recipes WHERE id_recipes = ?',
       [id]
     );
-
     if (existing.length === 0) {
       await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'Recipe not found'
-      });
+      return res.status(404).json({ success: false, message: 'Recipe not found' });
     }
 
-    // FIX: verificar nombre duplicado (excluyendo la receta actual)
     const [duplicate] = await connection.execute(
       'SELECT id_recipes FROM recipes WHERE id_stores = ? AND LOWER(TRIM(recipe_name)) = LOWER(TRIM(?)) AND id_recipes != ?',
       [existing[0].id_stores, name, id]
     );
-
     if (duplicate.length > 0) {
       await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: 'A recipe with that name already exists'
-      });
+      return res.status(409).json({ success: false, message: 'A recipe with that name already exists' });
     }
 
-    // FIX: calcular costo total incluyendo preparations
+    // Costo total
     let totalCost = 0;
-    (ingredients  || []).forEach(ing  => { totalCost += parseFloat(ing.totalCost)  || 0; });
-    (preparations || []).forEach(prep => { totalCost += parseFloat(prep.totalCost) || 0; });
+    items.forEach(it => { if (it.itemType === 'product' || it.itemType === 'prep') totalCost += parseFloat(it.totalCost) || 0; });
 
-    // Actualizar receta
     await connection.execute(
       `UPDATE recipes 
        SET pos_id_number = ?, recipe_name = ?, total_cost = ?, updated_at = CURRENT_TIMESTAMP
@@ -324,105 +340,35 @@ const updateRecipe = async (req, res) => {
       [posIdNumber || null, name.trim(), totalCost, id]
     );
 
-    // Eliminar todos los ingredientes existentes (productos y preps)
-    await connection.execute(
-      'DELETE FROM recipe_ingredients WHERE id_recipe = ?',
-      [id]
-    );
-
-    // Insertar ingredientes (productos)
-    for (const ingredient of (ingredients || [])) {
-      await connection.execute(
-        `INSERT INTO recipe_ingredients 
-         (id_recipe, id_product, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'product', ?, ?, ?, ?)`,
-        [
-          id,
-          ingredient.productId,
-          ingredient.quantity,
-          ingredient.unit,
-          ingredient.unitCost,
-          ingredient.totalCost
-        ]
-      );
-    }
-
-    // Insertar preparations (pre-batch)
-    for (const prep of (preparations || [])) {
-      const unitCost = parseFloat(prep.quantity) > 0
-        ? (parseFloat(prep.totalCost) / parseFloat(prep.quantity)).toFixed(6)
-        : 0;
-
-      await connection.execute(
-        `INSERT INTO recipe_ingredients 
-         (id_recipe, id_prep, item_type, quantity, unit, unit_cost, total_cost)
-         VALUES (?, ?, 'prep', ?, ?, ?, ?)`,
-        [
-          id,
-          prep.prepId,
-          prep.quantity,
-          prep.unit || 'Each',
-          unitCost,
-          prep.totalCost
-        ]
-      );
-    }
+    await connection.execute('DELETE FROM recipe_ingredients WHERE id_recipe = ?', [id]);
+    await insertRecipeItems(connection, id, items);
 
     await connection.commit();
-
-    res.json({
-      success: true,
-      message: 'Recipe updated successfully'
-    });
+    res.json({ success: true, message: 'Recipe updated successfully' });
   } catch (error) {
     await connection.rollback();
     console.error('Error updating recipe:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error updating recipe',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error updating recipe', error: error.message });
   } finally {
     connection.release();
   }
 };
 
-// Eliminar receta
+// ============================================================
+// DELETE RECIPE
+// ============================================================
 const deleteRecipe = async (req, res) => {
   try {
     const { id } = req.params;
-
-    // FIX: SQL corregido (tenía "AND id_recipes" colgado)
-    const [result] = await pool.execute(
-      'DELETE FROM recipes WHERE id_recipes = ?',
-      [id]
-    );
-
+    const [result] = await pool.execute('DELETE FROM recipes WHERE id_recipes = ?', [id]);
     if (result.affectedRows === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Recipe not found'
-      });
+      return res.status(404).json({ success: false, message: 'Recipe not found' });
     }
-
-    res.json({
-      success: true,
-      message: 'Recipe deleted successfully'
-    });
+    res.json({ success: true, message: 'Recipe deleted successfully' });
   } catch (error) {
     console.error('Error deleting recipe:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error deleting recipe',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error deleting recipe', error: error.message });
   }
 };
 
-module.exports = {
-  getAllRecipes,
-  getRecipeById,
-  createRecipe,
-  updateRecipe,
-  deleteRecipe
-};
+module.exports = { getAllRecipes, getRecipeById, createRecipe, updateRecipe, deleteRecipe };
