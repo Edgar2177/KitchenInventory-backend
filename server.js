@@ -79,6 +79,9 @@ app.use('/api/invoices', invoicesRoutes);
 const modifiersRoutes = require('./src/routes/modifiers')
 app.use('/api/modifiers', modifiersRoutes);
 
+const reportsRoutes = require('./src/routes/reports');
+app.use('/api/reports', reportsRoutes);
+
 // Manejo de rutas no encontradas
 app.use((req, res) => {
   res.status(404).json({
