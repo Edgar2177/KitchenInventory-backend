@@ -119,6 +119,7 @@ const getPrepById = async (req, res) => {
         yield_quantity               AS yieldQuantity,
         yield_unit                   AS yieldUnit,
         yield_unit_cost              AS yieldUnitCost,
+        to_prepare_qty               AS toPrepareQty,
         show_in_physical_inventory   AS showInPhysicalInventory,
         instructions                 AS instructions,
         created_at                   AS createdAt
@@ -285,7 +286,7 @@ const createPrep = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { storeId, name, yieldQuantity, yieldUnit, showInPhysicalInventory, instructions } = req.body;
+    const { storeId, name, yieldQuantity, yieldUnit, showInPhysicalInventory, instructions, toPrepareQty } = req.body;
     const items = buildOrderedItems(req.body);
 
     if (!storeId) {
@@ -322,12 +323,14 @@ const createPrep = async (req, res) => {
 
     const showInPI = showInPhysicalInventory === false ? 0 : 1;
     const instructionsValue = instructions && instructions.trim() ? instructions.trim() : null;
+    const toPrepareValue = (toPrepareQty !== undefined && toPrepareQty !== null && toPrepareQty !== '' && !isNaN(parseFloat(toPrepareQty)))
+      ? parseFloat(toPrepareQty) : null;
 
     // Insertar prep
     const [result] = await connection.execute(
-      `INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost, show_in_physical_inventory, instructions)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI, instructionsValue]
+      `INSERT INTO preps (id_store, prep_name, total_cost, yield_quantity, yield_unit, yield_unit_cost, to_prepare_qty, show_in_physical_inventory, instructions)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [storeId, name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, toPrepareValue, showInPI, instructionsValue]
     );
     const prepId = result.insertId;
 
@@ -359,7 +362,7 @@ const updatePrep = async (req, res) => {
     await connection.beginTransaction();
 
     const { id } = req.params;
-    const { name, yieldQuantity, yieldUnit, showInPhysicalInventory, instructions } = req.body;
+    const { name, yieldQuantity, yieldUnit, showInPhysicalInventory, instructions, toPrepareQty } = req.body;
     const items = buildOrderedItems(req.body);
 
     if (!name?.trim()) {
@@ -409,14 +412,16 @@ const updatePrep = async (req, res) => {
 
     const showInPI = showInPhysicalInventory === false ? 0 : 1;
     const instructionsValue = instructions && instructions.trim() ? instructions.trim() : null;
+    const toPrepareValue = (toPrepareQty !== undefined && toPrepareQty !== null && toPrepareQty !== '' && !isNaN(parseFloat(toPrepareQty)))
+      ? parseFloat(toPrepareQty) : null;
 
     // Actualizar prep
     await connection.execute(
       `UPDATE preps
        SET prep_name = ?, total_cost = ?, yield_quantity = ?, yield_unit = ?,
-           yield_unit_cost = ?, show_in_physical_inventory = ?, instructions = ?, updated_at = CURRENT_TIMESTAMP
+           yield_unit_cost = ?, to_prepare_qty = ?, show_in_physical_inventory = ?, instructions = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id_preps = ?`,
-      [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, showInPI, instructionsValue, id]
+      [name.trim(), totalCost, yieldQuantity ? parseFloat(yieldQuantity) : null, yieldUnit || null, yieldUnitCost, toPrepareValue, showInPI, instructionsValue, id]
     );
 
     // Limpiar y re-insertar todo con display_order global
