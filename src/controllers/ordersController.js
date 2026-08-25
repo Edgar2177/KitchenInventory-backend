@@ -88,24 +88,21 @@ const calcStockUnits = (rows, containerSizeBaseUnit) => {
 // ============================================
 // GENERATE ORDER NUMBER (inline — no SP)
 // ============================================
-const generateOrderNumber = async (connection, storeId) => {
+const generateOrderNumber = async (connection) => {
   const year = new Date().getFullYear();
 
-  const [[lastOrder]] = await connection.execute(
-    `SELECT order_number FROM orders 
-     WHERE id_store = ? AND order_number LIKE ?
-     ORDER BY id_orders DESC LIMIT 1`,
-    [storeId, `ORD-${year}-%`]
+  // El índice UNIQUE de order_number es GLOBAL (no por store), así que el
+  // correlativo se calcula sobre TODAS las órdenes del año, no solo las del store.
+  // MAX del número real (no COUNT ni ORDER BY id) para evitar huecos/duplicados.
+  const [[row]] = await connection.execute(
+    `SELECT MAX(CAST(SUBSTRING_INDEX(order_number, '-', -1) AS UNSIGNED)) AS maxNum
+     FROM orders
+     WHERE order_number LIKE ?`,
+    [`ORD-${year}-%`]
   );
 
-  let nextNum = 1;
-  if (lastOrder?.order_number) {
-    const parts = lastOrder.order_number.split('-');
-    const parsed = parseInt(parts[2]);
-    if (!isNaN(parsed)) nextNum = parsed + 1;
-  }
-
-  return `ORD-${year}-${String(nextNum).padStart(3, '0')}`;
+  const maxNum = row && row.maxNum ? parseInt(row.maxNum) : 0;
+  return maxNum + 1; // devuelve el siguiente entero (el string se arma en createOrder)
 };
 
 // ============================================
@@ -376,7 +373,6 @@ const createOrder = async (req, res) => {
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
-    const orderNumber = await generateOrderNumber(connection, storeId);
 
     let totalItems  = 0;
     let totalAmount = 0;
@@ -387,13 +383,32 @@ const createOrder = async (req, res) => {
       }
     });
 
-    const [orderResult] = await connection.execute(
-      `INSERT INTO orders (id_store, id_vendor, id_inventory, order_number, order_date, status, total_items, total_amount, notes, created_by)
-       VALUES (?, ?, ?, ?, NOW(), 'Draft', ?, ?, ?, ?)`,
-      [storeId, vendorId, inventoryId, orderNumber, totalItems, totalAmount, notes, createdBy]
-    );
+    // Generar order_number a prueba de duplicados: parte del MAX global y
+    // reintenta incrementando si dos órdenes chocan (p. ej. "Send All").
+    const year = new Date().getFullYear();
+    let nextNum = await generateOrderNumber(connection);
+    let orderNumber = null;
+    let orderId = null;
 
-    const orderId = orderResult.insertId;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      orderNumber = `ORD-${year}-${String(nextNum).padStart(3, '0')}`;
+      try {
+        const [orderResult] = await connection.execute(
+          `INSERT INTO orders (id_store, id_vendor, id_inventory, order_number, order_date, status, total_items, total_amount, notes, created_by)
+           VALUES (?, ?, ?, ?, NOW(), 'Draft', ?, ?, ?, ?)`,
+          [storeId, vendorId, inventoryId, orderNumber, totalItems, totalAmount, notes, createdBy]
+        );
+        orderId = orderResult.insertId;
+        break;
+      } catch (err) {
+        if (err && err.code === 'ER_DUP_ENTRY') { nextNum++; continue; }
+        throw err;
+      }
+    }
+
+    if (orderId === null) {
+      throw new Error('Could not generate a unique order number after multiple attempts');
+    }
 
     for (const item of items) {
       if (item.actual_order > 0) {
