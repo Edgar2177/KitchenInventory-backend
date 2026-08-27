@@ -67,6 +67,7 @@ const calculatePrepSuggestions = async (req, res) => {
         p.reorder_point
       FROM preps p
       WHERE p.id_store = ?
+        AND p.show_in_physical_inventory = 1
       ORDER BY p.prep_name`,
       [storeId]
     );

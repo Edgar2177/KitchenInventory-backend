@@ -33,6 +33,7 @@ const getPrepsByStore = async (req, res) => {
        LEFT JOIN products prod ON pi.id_product  = prod.id_products AND pi.item_type = 'product'
        LEFT JOIN preps    pr2  ON pi.id_prep_ref = pr2.id_preps     AND pi.item_type = 'prep'
        WHERE p.id_store = ?
+         AND p.show_in_physical_inventory = 1
        GROUP BY p.id_preps
        ORDER BY p.prep_name`,
       [storeId]
