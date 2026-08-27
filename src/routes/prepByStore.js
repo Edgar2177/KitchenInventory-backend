@@ -3,7 +3,7 @@ const router = express.Router();
 const {
   getPrepsByStore,
   updatePrepParReorder
-} = require('../controllers/prepByStoreController');
+} = require('../controllers/prepbyStorecontroller');
 
 router.get('/store/:storeId', getPrepsByStore);
 router.put('/:id', updatePrepParReorder);
