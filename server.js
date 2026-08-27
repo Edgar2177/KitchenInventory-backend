@@ -82,6 +82,12 @@ app.use('/api/modifiers', modifiersRoutes);
 const reportsRoutes = require('./src/routes/reports');
 app.use('/api/reports', reportsRoutes);
 
+const prepByStoreRoutes = require('./src/routes/prepByStore');
+app.use('/api/prep-by-store', prepByStoreRoutes);
+
+const prepOrderingRoutes = require('./src/routes/prepOrdering');
+app.use('/api/prep-ordering', prepOrderingRoutes);
+
 // Manejo de rutas no encontradas
 app.use((req, res) => {
   res.status(404).json({

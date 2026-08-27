@@ -23,14 +23,7 @@ const getOrCreatePhysicalLocation = async (connection, storeId) => {
 // ========================================
 // FUNCIÓN AUXILIAR
 // Resolver el precio POR UNIDAD a partir del wholesale_price (precio del
-// contenedor completo) y el case_size. Esto replica exactamente la lógica
-// de resolvePrices() en Inventories.jsx, para que el WS Value calculado
-// aquí en el backend coincida con el que calcula ese módulo.
-//
-// Ej: wholesale_price = $25.00 (precio de la caja), case_size = 12
-//     -> unitPrice = 25 / 12 = $2.08 por unidad
-// Si no hay case_size (o es 0/null), el wholesale_price YA es el precio
-// por unidad, así que se usa tal cual.
+// contenedor completo) y el case_size.
 // ========================================
 const resolveUnitPrice = (wholesalePrice, caseSize) => {
   const price = parseFloat(wholesalePrice) || 0;
@@ -117,9 +110,7 @@ const getPhysicalInventoryById = async (req, res) => {
       [storeId]
     );
 
-    // 2. Todos los preps del store QUE SE MARCARON PARA CONTARSE en Physical
-    //    Inventory (show_in_physical_inventory = 1). Los que el usuario marcó
-    //    como "no mostrar" simplemente no entran a esta lista.
+    // 2. Todos los preps del store marcados para contarse
     const [allPreps] = await pool.execute(
       `SELECT 
         pr.id_preps,
@@ -205,6 +196,33 @@ const getPhysicalInventoryById = async (req, res) => {
       [storeId, storeId, inventoryDate, id]
     );
 
+    // 5b. Last Inv de PREPS = suma del mismo día más reciente anterior (item_type = 'prep')
+    //     Los preps se cuentan en 'Each', así que es suma directa de quantity.
+    const [lastInvPrepData] = await pool.execute(
+      `SELECT 
+        ii.id_prep,
+        SUM(ii.quantity) as last_quantity
+       FROM inventory_items ii
+       INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+       WHERE i.id_store = ?
+         AND i.status = 'Locked'
+         AND ii.item_type = 'prep'
+         AND DATE(i.inventory_date) = (
+           SELECT DATE(i2.inventory_date)
+           FROM inventories i2
+           WHERE i2.id_store = ?
+             AND i2.status = 'Locked'
+             AND DATE(i2.inventory_date) < DATE(?)
+             AND i2.id_inventories != ?
+           ORDER BY i2.inventory_date DESC
+           LIMIT 1
+         )
+       GROUP BY ii.id_prep`,
+      [storeId, storeId, inventoryDate, id]
+    );
+    const lastInvPrepMap = {};
+    lastInvPrepData.forEach(item => { lastInvPrepMap[item.id_prep] = parseFloat(item.last_quantity) || 0; });
+
     const purchaseMap = {};
       if (prevInvDate) {
         try {
@@ -269,7 +287,7 @@ const getPhysicalInventoryById = async (req, res) => {
       container_size:    p.container_size || null,
       container_unit:    p.container_unit || '',
       container_type:    'Each',
-      last_inv_quantity: 0,
+      last_inv_quantity: lastInvPrepMap[p.id_preps] ?? 0,
       inv_quantity:      savedPrepMap[p.id_preps] ?? null,
       display_order:     allProducts.length + i + 1
     }));
@@ -350,8 +368,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
         }
       }
 
-    // Todos los preps del store QUE SE MARCARON PARA CONTARSE en Physical
-    // Inventory (show_in_physical_inventory = 1).
+    // Todos los preps del store marcados para contarse
     const [preps] = await pool.execute(
       `SELECT 
         pr.id_preps,
@@ -407,6 +424,30 @@ const getProductsForPhysicalInventory = async (req, res) => {
       [storeId, storeId]
     );
 
+    // Last Inv de PREPS = suma del mismo día más reciente (item_type = 'prep')
+    const [lastInvPrepData] = await pool.execute(
+      `SELECT 
+        ii.id_prep,
+        SUM(ii.quantity) as last_quantity
+       FROM inventory_items ii
+       INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+       WHERE i.id_store = ?
+         AND i.status = 'Locked'
+         AND ii.item_type = 'prep'
+         AND DATE(i.inventory_date) = (
+           SELECT DATE(i2.inventory_date)
+           FROM inventories i2
+           WHERE i2.id_store = ?
+             AND i2.status = 'Locked'
+           ORDER BY i2.inventory_date DESC
+           LIMIT 1
+         )
+       GROUP BY ii.id_prep`,
+      [storeId, storeId]
+    );
+    const lastInvPrepMap = {};
+    lastInvPrepData.forEach(item => { lastInvPrepMap[item.id_prep] = parseFloat(item.last_quantity) || 0; });
+
     const lastInvMap = {};
     lastInvData.forEach(item => { lastInvMap[item.id_product] = parseFloat(item.last_quantity) || 0; });
 
@@ -423,7 +464,7 @@ const getProductsForPhysicalInventory = async (req, res) => {
       id_products:       null,
       case_size:          null,
       product_type_name: 'Pre-Batch',
-      last_inv_quantity: 0
+      last_inv_quantity: lastInvPrepMap[p.id_preps] ?? 0
     }));
 
     res.json({ success: true, data: [...productResults, ...prepResults] });
