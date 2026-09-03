@@ -139,7 +139,7 @@ const calculatePrepSuggestions = async (req, res) => {
 // ------------------------------------------------------------
 const sendPrepEmail = async (req, res) => {
   try {
-    const { storeId, toEmail, cc, items } = req.body;
+    const { storeId, inventoryId, toEmail, cc, items } = req.body;
 
     if (!toEmail)                     return res.status(400).json({ message: 'A destination email is required' });
     if (!items || items.length === 0) return res.status(400).json({ message: 'No items to send' });
@@ -154,6 +154,7 @@ const sendPrepEmail = async (req, res) => {
       if (store?.store_name) storeName = store.store_name;
     }
 
+    // 1) Enviar el correo PRIMERO. Si falla, no guardamos nada.
     const result = await sendPrepProductionEmail({
       to:         toEmail,
       cc:         cc || undefined,
@@ -161,15 +162,210 @@ const sendPrepEmail = async (req, res) => {
       items
     });
 
-    res.json({ success: true, message: 'Preparation list sent successfully', messageId: result.messageId });
+    // 2) El correo salió bien → persistir la orden de preparación.
+    //    Si el guardado fallara, el correo YA se envió: devolvemos éxito
+    //    igualmente y dejamos aviso en el log (no re-enviar).
+    let orderNumber = null;
+    try {
+      orderNumber = await persistPrepOrder({ storeId, inventoryId, toEmail, cc, items });
+    } catch (persistErr) {
+      console.error('Prep email sent but order was not saved:', persistErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: 'Preparation list sent successfully',
+      messageId: result.messageId,
+      order_number: orderNumber
+    });
   } catch (error) {
     console.error('Error sending prep email:', error);
     res.status(500).json({ message: 'Error sending preparation list', error: error.message });
   }
 };
 
+// ------------------------------------------------------------
+// HELPER: generar el siguiente PREP-YYYY-NNN (global, a prueba de duplicados)
+// Mismo criterio que arreglamos en Ordering: MAX del correlativo real.
+// ------------------------------------------------------------
+const nextPrepOrderSeq = async (connection) => {
+  const year = new Date().getFullYear();
+  const [[row]] = await connection.execute(
+    `SELECT MAX(CAST(SUBSTRING_INDEX(order_number, '-', -1) AS UNSIGNED)) AS maxNum
+     FROM prep_orders
+     WHERE order_number LIKE ?`,
+    [`PREP-${year}-%`]
+  );
+  const maxNum = row && row.maxNum ? parseInt(row.maxNum) : 0;
+  return maxNum + 1;
+};
+
+// ------------------------------------------------------------
+// HELPER: guardar la orden + items en una transacción.
+// Devuelve el order_number generado.
+// ------------------------------------------------------------
+const persistPrepOrder = async ({ storeId, inventoryId, toEmail, cc, items }) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const year = new Date().getFullYear();
+    let nextNum = await nextPrepOrderSeq(connection);
+    let orderNumber = null;
+    let orderId = null;
+
+    // Insertar cabecera con reintento por si el correlativo choca (carrera)
+    for (let attempt = 0; attempt < 50; attempt++) {
+      orderNumber = `PREP-${year}-${String(nextNum).padStart(3, '0')}`;
+      try {
+        const [r] = await connection.execute(
+          `INSERT INTO prep_orders
+             (id_store, order_number, id_inventory, sent_to, sent_cc, sent_at, total_items)
+           VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
+          [storeId, orderNumber, inventoryId || null, toEmail, cc || null, items.length]
+        );
+        orderId = r.insertId;
+        break;
+      } catch (err) {
+        if (err && err.code === 'ER_DUP_ENTRY') { nextNum++; continue; }
+        throw err;
+      }
+    }
+    if (orderId === null) throw new Error('Could not generate a unique prep order number');
+
+    // Insertar items (nombre "congelado")
+    for (const it of items) {
+      const qty = (it.actual_order !== undefined && it.actual_order !== null && it.actual_order !== '')
+        ? parseFloat(it.actual_order) : parseFloat(it.suggested_order) || 0;
+      await connection.execute(
+        `INSERT INTO prep_order_items (id_prep_order, id_prep, prep_name, quantity, unit)
+         VALUES (?, ?, ?, ?, ?)`,
+        [orderId, it.id_prep || null, it.prep_name, qty, it.yield_unit || null]
+      );
+    }
+
+    await connection.commit();
+    return orderNumber;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+// ------------------------------------------------------------
+// Fechas disponibles de órdenes de preparación (para el filtro)
+// GET /prep-ordering/view/dates?storeId=
+// ------------------------------------------------------------
+const getPrepOrderDates = async (req, res) => {
+  try {
+    const { storeId } = req.query;
+    if (!storeId) return res.status(400).json({ message: 'Store ID is required' });
+
+    const [dates] = await pool.execute(
+      `SELECT
+         DATE(sent_at) AS date,
+         COUNT(*)      AS order_count
+       FROM prep_orders
+       WHERE id_store = ? AND sent_at IS NOT NULL
+       GROUP BY DATE(sent_at)
+       ORDER BY DATE(sent_at) DESC`,
+      [storeId]
+    );
+
+    res.json({ success: true, data: dates });
+  } catch (error) {
+    console.error('Error fetching prep order dates:', error);
+    res.status(500).json({ message: 'Error fetching prep order dates', error: error.message });
+  }
+};
+
+// ------------------------------------------------------------
+// Órdenes de preparación de una fecha (con sus items)
+// GET /prep-ordering/view?storeId=&filterDate=
+// ------------------------------------------------------------
+const getPrepOrdersForView = async (req, res) => {
+  try {
+    const { storeId, filterDate } = req.query;
+    if (!storeId || !filterDate) {
+      return res.status(400).json({ message: 'Store ID and date are required' });
+    }
+
+    const [orders] = await pool.execute(
+      `SELECT
+         id_prep_order AS id_prep_order,
+         order_number,
+         id_inventory,
+         sent_to,
+         sent_cc,
+         sent_at,
+         total_items
+       FROM prep_orders
+       WHERE id_store = ? AND DATE(sent_at) = ?
+       ORDER BY sent_at DESC, id_prep_order DESC`,
+      [storeId, filterDate]
+    );
+
+    if (orders.length === 0) {
+      return res.json({ success: true, orders: [] });
+    }
+
+    const ids = orders.map(o => o.id_prep_order);
+    const placeholders = ids.map(() => '?').join(',');
+    const [items] = await pool.execute(
+      `SELECT id_prep_order, id_prep, prep_name, quantity, unit
+       FROM prep_order_items
+       WHERE id_prep_order IN (${placeholders})
+       ORDER BY id_prep_order_item ASC`,
+      ids
+    );
+
+    const itemsByOrder = {};
+    items.forEach(it => {
+      const k = String(it.id_prep_order);
+      if (!itemsByOrder[k]) itemsByOrder[k] = [];
+      itemsByOrder[k].push(it);
+    });
+
+    const withItems = orders.map(o => ({
+      ...o,
+      items: itemsByOrder[String(o.id_prep_order)] || []
+    }));
+
+    res.json({ success: true, orders: withItems });
+  } catch (error) {
+    console.error('Error fetching prep orders:', error);
+    res.status(500).json({ message: 'Error fetching prep orders', error: error.message });
+  }
+};
+
+// ------------------------------------------------------------
+// Eliminar una orden de preparación (items se van por ON DELETE CASCADE)
+// DELETE /prep-ordering/view/:id
+// ------------------------------------------------------------
+const deletePrepOrder = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [result] = await pool.execute(
+      'DELETE FROM prep_orders WHERE id_prep_order = ?',
+      [id]
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Prep order not found' });
+    }
+    res.json({ success: true, message: 'Prep order deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting prep order:', error);
+    res.status(500).json({ message: 'Error deleting prep order', error: error.message });
+  }
+};
+
 module.exports = {
   getInventoriesForPrepOrdering,
   calculatePrepSuggestions,
-  sendPrepEmail
+  sendPrepEmail,
+  getPrepOrderDates,
+  getPrepOrdersForView,
+  deletePrepOrder
 };
