@@ -339,6 +339,7 @@ const getAvailableProducts = async (req, res) => {
         yield_unit_cost
        FROM preps
        WHERE id_store = ?
+         AND show_in_physical_inventory = 1
        ORDER BY prep_name`,
       [storeId]
     );
@@ -898,6 +899,7 @@ const getInventoryProducts = async (req, res) => {
                AND ii.id_inventory = ?
                AND ii.item_type    = 'prep'
          WHERE pr.id_store = ?
+           AND pr.show_in_physical_inventory = 1
            AND (
              ii.id_inventory_item IS NULL
              OR ii.quantity IS NULL

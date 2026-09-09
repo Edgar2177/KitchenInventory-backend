@@ -505,9 +505,12 @@ const createPhysicalInventory = async (req, res) => {
 
     let displayOrder = 1;
     for (const item of items) {
-      const qty       = parseFloat(item.inv_quantity) || 0;
+      // Distinguir "sin valor" (no se guarda, queda pendiente) de "0" (conteo real, sí se guarda)
+      const raw       = item.inv_quantity;
+      const hasValue  = raw !== null && raw !== undefined && raw !== '' && !isNaN(parseFloat(raw));
+      const qty       = hasValue ? parseFloat(raw) : 0;
       const unitPrice = resolveUnitPrice(item.wholesale_price, item.case_size);
-      if (qty > 0) {
+      if (hasValue) {
         if (item.item_type === 'prep') {
           await connection.execute(
             `INSERT INTO inventory_items 
@@ -602,9 +605,12 @@ const updatePhysicalInventory = async (req, res) => {
 
     let displayOrder = 1;
     for (const item of items) {
-      const qty       = parseFloat(item.inv_quantity) || 0;
+      // Distinguir "sin valor" (no se guarda, queda pendiente) de "0" (conteo real, sí se guarda)
+      const raw       = item.inv_quantity;
+      const hasValue  = raw !== null && raw !== undefined && raw !== '' && !isNaN(parseFloat(raw));
+      const qty       = hasValue ? parseFloat(raw) : 0;
       const unitPrice = resolveUnitPrice(item.wholesale_price, item.case_size);
-      if (qty > 0) {
+      if (hasValue) {
         if (item.item_type === 'prep') {
           await connection.execute(
             `INSERT INTO inventory_items 
