@@ -840,8 +840,9 @@ const getInventoryProducts = async (req, res) => {
       // Un producto "no contado" es aquel que:
       //   1. Existe en products_by_store para esta tienda, Y
       //   2. NO aparece en inventory_items de este inventario
-      //      O aparece pero con quantity IS NULL / quantity < 0.01
-      // Igual que "is_missing_from_inventory" en el módulo de Ordering.
+      //      O aparece pero con quantity IS NULL (nunca se guardó una cantidad)
+      // Un producto guardado con quantity = 0 SÍ cuenta como contado y por lo
+      // tanto queda excluido de este listado.
       [items] = await pool.execute(
         `SELECT
            COALESCE(ii.display_order, 9999)  AS display_order,
@@ -874,14 +875,13 @@ const getInventoryProducts = async (req, res) => {
            AND (
              ii.id_inventory_item IS NULL          -- no aparece en el inventario
              OR ii.quantity IS NULL                 -- aparece pero sin cantidad
-             OR ii.quantity < 0.01                  -- aparece con cantidad 0 o 0.00
            )
          ORDER BY c.category_name ASC, p.product_name ASC`,
         [inventoryId, storeId]
       );
 
       // Preps no contados: los que existen en la tienda pero no están en este inventario
-      // o están con quantity < 0.01
+      // o están con quantity IS NULL (guardados con 0 SÍ cuentan como contados)
       [prepData] = await pool.execute(
         `SELECT
            COALESCE(ii.display_order, 9999) AS display_order,
@@ -903,7 +903,6 @@ const getInventoryProducts = async (req, res) => {
            AND (
              ii.id_inventory_item IS NULL
              OR ii.quantity IS NULL
-             OR ii.quantity < 0.01
            )
          ORDER BY pr.prep_name ASC`,
         [inventoryId, storeId]
@@ -975,9 +974,10 @@ const getInventoryProducts = async (req, res) => {
 // NUEVO: Productos NO CONTADOS por FECHA (toda la tienda)
 // GET /inventories/uncounted-by-date?storeId=&date=YYYY-MM-DD
 // ----------------------------------------
-// Un producto/prep está "no contado" en esa fecha si NO aparece contado
-// (quantity >= 0.01) en NINGÚN inventario Locked de esa fecha, sin importar
-// la locación. Sirve para cargar en un inventario nuevo (p. ej. la location
+// Un producto/prep está "no contado" en esa fecha si NO tiene NINGÚN registro
+// con quantity IS NOT NULL en ningún inventario Locked de esa fecha, sin
+// importar la locación. Un producto guardado con quantity = 0 SÍ cuenta como
+// contado. Sirve para cargar en un inventario nuevo (p. ej. la location
 // "No location items") lo que se quedó fuera ese día en toda la tienda.
 // ========================================
 const getUncountedByDate = async (req, res) => {
@@ -1023,7 +1023,6 @@ const getUncountedByDate = async (req, res) => {
              AND i.status = 'Locked'
              AND DATE(i.inventory_date) = ?
              AND ii.quantity IS NOT NULL
-             AND ii.quantity >= 0.01
          )
        ORDER BY c.category_name ASC, p.product_name ASC`,
       [storeId, storeId, date]
@@ -1054,7 +1053,6 @@ const getUncountedByDate = async (req, res) => {
              AND i.status = 'Locked'
              AND DATE(i.inventory_date) = ?
              AND ii.quantity IS NOT NULL
-             AND ii.quantity >= 0.01
          )
        ORDER BY pr.prep_name ASC`,
       [storeId, storeId, date]
