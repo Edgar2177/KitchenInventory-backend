@@ -972,6 +972,105 @@ const getInventoryProducts = async (req, res) => {
 };
 
 // ========================================
+// NUEVO: Productos NO CONTADOS por FECHA (toda la tienda)
+// GET /inventories/uncounted-by-date?storeId=&date=YYYY-MM-DD
+// ----------------------------------------
+// Un producto/prep está "no contado" en esa fecha si NO aparece contado
+// (quantity >= 0.01) en NINGÚN inventario Locked de esa fecha, sin importar
+// la locación. Sirve para cargar en un inventario nuevo (p. ej. la location
+// "No location items") lo que se quedó fuera ese día en toda la tienda.
+// ========================================
+const getUncountedByDate = async (req, res) => {
+  try {
+    const { storeId, date } = req.query;
+    if (!storeId || !date) {
+      return res.status(400).json({ success: false, message: 'storeId and date are required' });
+    }
+
+    // Productos de la tienda que NO fueron contados en ningún inventario Locked de esa fecha
+    const [items] = await pool.execute(
+      `SELECT
+         9999                       AS display_order,
+         p.container_type           AS quantity_type,
+         NULL                       AS quantity,
+         p.full_weight_base_unit    AS full_weight,
+         p.empty_weight_base_unit   AS empty_weight,
+         NULL                       AS net_weight,
+         p.id_products              AS productId,
+         p.product_name             AS productName,
+         p.product_code             AS productCode,
+         p.container_type           AS containerType,
+         p.container_size           AS containerSize,
+         p.container_unit           AS containerUnit,
+         p.case_size                AS caseSize,
+         p.full_weight_base_unit    AS product_full_weight,
+         p.empty_weight_base_unit   AS product_empty_weight,
+         p.wholesale_price          AS wholesalePrice,
+         c.category_name,
+         pt.product_name            AS product_type_name
+       FROM products_by_store pbs
+       INNER JOIN products p    ON pbs.id_product     = p.id_products
+       LEFT  JOIN categories c    ON p.id_category     = c.id_categories
+       LEFT  JOIN product_types pt ON p.id_product_type = pt.id_product_types
+       WHERE pbs.id_store = ?
+         AND NOT EXISTS (
+           SELECT 1
+           FROM inventory_items ii
+           INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+           WHERE ii.id_product = p.id_products
+             AND ii.item_type = 'product'
+             AND i.id_store = ?
+             AND i.status = 'Locked'
+             AND DATE(i.inventory_date) = ?
+             AND ii.quantity IS NOT NULL
+             AND ii.quantity >= 0.01
+         )
+       ORDER BY c.category_name ASC, p.product_name ASC`,
+      [storeId, storeId, date]
+    );
+
+    // Preps de la tienda (marcados para inventario) no contados en ningún Locked de esa fecha
+    const [prepData] = await pool.execute(
+      `SELECT
+         9999               AS display_order,
+         pr.yield_unit      AS quantity_type,
+         NULL               AS quantity,
+         pr.id_preps        AS prepId,
+         pr.prep_name       AS prepName,
+         pr.yield_quantity  AS yieldQuantity,
+         pr.yield_unit      AS yieldUnit,
+         pr.yield_unit_cost AS yieldUnitCost,
+         pr.total_cost      AS totalCost
+       FROM preps pr
+       WHERE pr.id_store = ?
+         AND pr.show_in_physical_inventory = 1
+         AND NOT EXISTS (
+           SELECT 1
+           FROM inventory_items ii
+           INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+           WHERE ii.id_prep = pr.id_preps
+             AND ii.item_type = 'prep'
+             AND i.id_store = ?
+             AND i.status = 'Locked'
+             AND DATE(i.inventory_date) = ?
+             AND ii.quantity IS NOT NULL
+             AND ii.quantity >= 0.01
+         )
+       ORDER BY pr.prep_name ASC`,
+      [storeId, storeId, date]
+    );
+
+    res.json({ success: true, data: items, prepData, date });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching uncounted products by date',
+      error: error.message
+    });
+  }
+};
+
+// ========================================
 // IMPORTAR INVENTARIO DESDE EXCEL
 // ========================================
 const importInventoryFromExcel = async (req, res) => {
@@ -1337,4 +1436,5 @@ module.exports = {
   getProductsForPrintInventory,
   getInventoriesByLocation,
   getInventoryProducts,
+  getUncountedByDate,
 };

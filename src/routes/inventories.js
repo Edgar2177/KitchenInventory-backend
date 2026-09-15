@@ -16,6 +16,7 @@ const {
   getProductsForPrintInventory,
   getInventoriesByLocation,
   getInventoryProducts,
+  getUncountedByDate,
 } = require('../controllers/inventoriesController');
 
 // Rutas especiales con path fijo (deben estar ANTES de /:id)
@@ -24,6 +25,7 @@ router.get('/available-products', getAvailableProducts);
 router.get('/last-products/:locationId', getLastInventoryProducts);
 router.get('/print-format', getProductsForPrintInventory);
 router.get('/by-location/:locationId', getInventoriesByLocation);
+router.get('/uncounted-by-date', getUncountedByDate);
 
 // Rutas CRUD básicas
 router.get('/', getAllInventories);
