@@ -136,7 +136,11 @@ const getInvoiceByOrder = async (req, res) => {
       if (existing.length > 0) {
         const invoice = existing[0];
         const [items] = await pool.execute(
-          `SELECT * FROM invoice_items WHERE id_invoice = ? ORDER BY is_extra ASC, product_name ASC`,
+          `SELECT ii.*, p.container_type
+             FROM invoice_items ii
+             LEFT JOIN products p ON ii.id_product = p.id_products
+            WHERE ii.id_invoice = ?
+            ORDER BY ii.is_extra ASC, ii.product_name ASC`,
           [invoice.id_invoice]
         );
         return res.json({ success: true, data: { ...invoice, items } });
@@ -154,9 +158,13 @@ const getInvoiceByOrder = async (req, res) => {
     if (existing.length > 0) {
       const invoice = existing[0];
       const [items] = await pool.execute(
-        `SELECT * FROM invoice_items WHERE id_invoice = ? ORDER BY is_extra ASC, product_name ASC`,
-        [invoice.id_invoice]
-      );
+          `SELECT ii.*, p.container_type
+             FROM invoice_items ii
+             LEFT JOIN products p ON ii.id_product = p.id_products
+            WHERE ii.id_invoice = ?
+            ORDER BY ii.is_extra ASC, ii.product_name ASC`,
+          [invoice.id_invoice]
+        );
       return res.json({ success: true, data: { ...invoice, items } });
     }
 
@@ -170,6 +178,8 @@ const getInvoiceByOrder = async (req, res) => {
         p.product_code,
         p.container_size,
         p.container_unit,
+        p.container_type,
+        p.case_size,
         p.wholesale_price
        FROM order_items oi
        INNER JOIN products p ON oi.id_product = p.id_products
@@ -187,6 +197,8 @@ const getInvoiceByOrder = async (req, res) => {
       container_unit:  item.container_unit,
       ordered_qty:     parseFloat(item.ordered_qty) || 0,
       received_qty:    null,
+      container_type:  item.container_type, 
+      case_size:       item.case_size || null,
       price_app:       parseFloat(item.price_app || item.wholesale_price) || 0,
       price_invoice:   null,
       is_extra:        0
@@ -249,11 +261,23 @@ const saveInvoice = async (req, res) => {
     // Draft cuando silent=true, Saved cuando silent=false
     const invoiceStatus = silent ? 'Draft' : 'Saved';
 
+    // price_app / price_invoice siempre son precio POR CASE. Si el usuario
+    // recibió el producto por su container_type (ej. "Bag") en vez de por
+    // "Case", received_qty viene en unidades sueltas y hay que convertirlo
+    // a cases (÷ case_size) antes de multiplicar por el precio — si no, el
+    // total sale inflado (ej. 30 bolsitas se cobraban como 30 cajas).
+    const getQtyInCases = (item) => {
+      const qty = parseFloat(item.received_qty) || 0;
+      if (!item.received_by || item.received_by === 'Case') return qty;
+      const caseSize = parseFloat(item.case_size) || 0;
+      return caseSize > 0 ? qty / caseSize : qty; // sin case_size no hay forma de convertir
+    };
+
     let totalAmount = 0;
     items.forEach(item => {
-      const qty   = parseFloat(item.received_qty)  || 0;
+      const qtyInCases = getQtyInCases(item);
       const price = parseFloat(item.price_invoice) || parseFloat(item.price_app) || 0;
-      totalAmount += qty * price;
+      totalAmount += qtyInCases * price;
     });
 
     let invoiceId;
@@ -379,8 +403,8 @@ const saveInvoice = async (req, res) => {
       await connection.execute(
         `INSERT INTO invoice_items
            (id_invoice, id_product, product_name, product_code, container_size, container_unit,
-            ordered_qty, received_qty, price_app, price_invoice, is_extra)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ordered_qty, received_qty, price_app, price_invoice, is_extra, received_by, case_size)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           invoiceId,
           item.id_product     || null,
@@ -392,7 +416,9 @@ const saveInvoice = async (req, res) => {
           receivedQty,
           priceApp,
           priceInvoice,
-          item.is_extra ? 1 : 0
+          item.is_extra ? 1 : 0,
+          item.received_by || null,
+          item.case_size   || null
         ]
       );
 
@@ -409,13 +435,19 @@ const saveInvoice = async (req, res) => {
         });
       }
 
-      if (!noOrder && !item.is_extra && Math.abs(receivedQty - orderedQty) > 0.001) {
+      // ordered_qty siempre viene en cases; si el item se recibió por su
+      // container_type (ej. "Bag") hay que convertir received_qty a cases
+      // antes de comparar, o se dispara una discrepancia falsa (ej. "30
+      // bolsitas" contra "2 cases" ordenadas, cuando en realidad cuadran).
+      const receivedQtyInCases = getQtyInCases(item);
+      if (!noOrder && !item.is_extra && Math.abs(receivedQtyInCases - orderedQty) > 0.001) {
         quantityDiscrepancies.push({
           product_name: item.product_name,
           product_code: item.product_code,
           ordered_qty:  orderedQty,
           received_qty: receivedQty,
-          difference:   parseFloat((receivedQty - orderedQty).toFixed(3))
+          received_by:  item.received_by || null,
+          difference:   parseFloat((receivedQtyInCases - orderedQty).toFixed(3))
         });
       }
     }
@@ -460,6 +492,7 @@ const saveInvoice = async (req, res) => {
                 product_name:  i.product_name,
                 product_code:  i.product_code,
                 received_qty:  i.received_qty  != null && i.received_qty  !== '' ? parseFloat(i.received_qty)  : 0,
+                received_by:   i.received_by || null,
                 price_invoice: i.price_invoice != null && i.price_invoice !== '' ? parseFloat(i.price_invoice) : parseFloat(i.price_app) || 0,
               }))
             });
@@ -570,6 +603,8 @@ const getProductsForStore = async (req, res) => {
         p.product_code,
         p.container_size,
         p.container_unit,
+        p.container_type,
+        p.case_size,
         p.wholesale_price
        FROM products p
        INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product

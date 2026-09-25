@@ -245,6 +245,7 @@ const sendInvoiceDiscrepancyEmail = async ({
           <th style="padding:8px 12px;text-align:left;color:#475569;">Product</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Order</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Qty Received</th>
+          <th style="padding:8px 12px;text-align:center;color:#475569;">Received By</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Unit Price</th>
           <th style="padding:8px 12px;text-align:center;color:#475569;">Subtotal</th>
         </tr>
@@ -262,6 +263,7 @@ const sendInvoiceDiscrepancyEmail = async ({
               </td>
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:600;">0</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:600;">${qty}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-size:12px;">${item.received_by || '—'}</td> 
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">${formatCurrency(price)}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:600;color:#0ea5e9;">${formatCurrency(subtotal)}</td>
             </tr>
@@ -288,6 +290,7 @@ const sendInvoiceDiscrepancyEmail = async ({
           <th style="padding:8px 12px;text-align:left;color:#92400e;">Product</th>
           <th style="padding:8px 12px;text-align:center;color:#92400e;">Ordered</th>
           <th style="padding:8px 12px;text-align:center;color:#92400e;">Received</th>
+          <th style="padding:8px 12px;text-align:center;color:#92400e;">Received By</th>
           <th style="padding:8px 12px;text-align:center;color:#92400e;">Difference</th>
         </tr>
       </thead>
@@ -297,6 +300,7 @@ const sendInvoiceDiscrepancyEmail = async ({
             <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${escapeHtml(d.product_name)}</td>
             <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">${d.ordered_qty}</td>
             <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">${d.received_qty}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-size:12px;">${d.received_by ? escapeHtml(d.received_by) : '—'}</td>
             <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;
                 color:${d.difference < 0 ? '#ef4444' : '#22c55e'};font-weight:600;">
               ${d.difference > 0 ? '+' : ''}${d.difference}
