@@ -10,6 +10,11 @@ const pool = require('../config/database');
 // El valor en dólares (Total) proviene del wholesale_value YA GUARDADO en
 // inventory_items (la misma valuación que suma Inventories en total_ws_value),
 // así el WS Total del reporte cuadra contra la pantalla de Inventories.
+//
+// Además de productos, el reporte incluye los PRE-BATCH (preps) contados en el
+// inventario de esa fecha. Salen en el mismo formato de fila, con categoría y
+// tipo "Pre-Batch" (igual que en Physical Inventory), y su Total también suma
+// al WS Total (Inventories también incluye los preps en total_ws_value).
 // ============================================================================
 
 // ── Helpers de conversión (idénticos a ordersController) ────────────────────
@@ -60,6 +65,27 @@ const calcStockUnits = (rows, containerSizeBaseUnit) => {
 
   return total;
 };
+
+// ── Preps (Pre-Batch) ───────────────────────────────────────────────────────
+// Un prep se cuenta en su propia unidad de rendimiento (yield_unit). Cada fila
+// guardada trae su quantity_type; si es una unidad de peso/volumen distinta al
+// yield_unit se convierte (misma tabla de conversión de toBaseGrams). Si es
+// 'Each' u otra unidad no convertible (Physical Inventory guarda los preps como
+// 'Each'), la cantidad ya viene en unidades del yield y se toma tal cual.
+const CONVERTIBLE_UNITS = ['g', 'kg', 'oz', 'lb', 'ml', 'L', 'Liter', 'Gallon', 'fl oz'];
+
+const prepQtyInYieldUnit = (quantity, quantityType, yieldUnit) => {
+  const qty = parseFloat(quantity) || 0;
+  if (!quantityType || quantityType === yieldUnit) return qty;
+  if (CONVERTIBLE_UNITS.includes(quantityType) && CONVERTIBLE_UNITS.includes(yieldUnit)) {
+    const yieldBase = toBaseGrams(1, yieldUnit) || 1;
+    return toBaseGrams(qty, quantityType) / yieldBase;
+  }
+  return qty;
+};
+
+const sumPrepQty = (items, yieldUnit) =>
+  items.reduce((acc, it) => acc + prepQtyInYieldUnit(it.quantity, it.quantity_type, yieldUnit), 0);
 
 const getVarianceReport = async (req, res) => {
   try {
@@ -161,6 +187,61 @@ const getVarianceReport = async (req, res) => {
       });
     }
 
+    // ── PRE-BATCH: preps contados en el inventario de esa fecha ───────────────
+    //    Base igual que con productos (todas las locaciones, solo Locked).
+    //    Total = wholesale_value guardado, igual que en productos.
+    const [prepRows] = await pool.execute(
+      `SELECT
+         pr.id_preps                    AS id_prep,
+         ANY_VALUE(pr.prep_name)        AS prep_name,
+         ANY_VALUE(pr.yield_quantity)   AS yield_quantity,
+         ANY_VALUE(pr.yield_unit)       AS yield_unit,
+         ANY_VALUE(pr.yield_unit_cost)  AS yield_unit_cost,
+         SUM(ii.wholesale_value)        AS total_ws
+       FROM inventory_items ii
+       INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+       INNER JOIN preps pr      ON ii.id_prep      = pr.id_preps
+       WHERE i.id_store = ? AND i.status = 'Locked'
+         AND DATE(i.inventory_date) = ?
+         AND ii.item_type = 'prep'
+       GROUP BY pr.id_preps`,
+      [storeId, currentDate]
+    );
+
+    const [currentPrepItems] = await pool.execute(
+      `SELECT ii.id_prep, ii.quantity_type, ii.quantity
+       FROM inventory_items ii
+       INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+       WHERE i.id_store = ? AND i.status = 'Locked'
+         AND DATE(i.inventory_date) = ?
+         AND ii.item_type = 'prep'`,
+      [storeId, currentDate]
+    );
+    const currentPrepByPrep = {};
+    currentPrepItems.forEach(item => {
+      const k = String(item.id_prep);
+      if (!currentPrepByPrep[k]) currentPrepByPrep[k] = [];
+      currentPrepByPrep[k].push(item);
+    });
+
+    const prevPrepByPrep = {};
+    if (prevDate) {
+      const [prevPrepItems] = await pool.execute(
+        `SELECT ii.id_prep, ii.quantity_type, ii.quantity
+         FROM inventory_items ii
+         INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+         WHERE i.id_store = ? AND i.status = 'Locked'
+           AND DATE(i.inventory_date) = ?
+           AND ii.item_type = 'prep'`,
+        [storeId, prevDate]
+      );
+      prevPrepItems.forEach(item => {
+        const k = String(item.id_prep);
+        if (!prevPrepByPrep[k]) prevPrepByPrep[k] = [];
+        prevPrepByPrep[k].push(item);
+      });
+    }
+
     // ── Purchase (idéntico a Ordering) ────────────────────────────────────────
     const purchaseMap = {};
     if (prevDate && currentDate) {
@@ -212,6 +293,8 @@ const getVarianceReport = async (req, res) => {
 
       return {
         id_product:        r.id_product,
+        id_prep:           null,
+        item_type:         'product',
         product_name:      r.product_name,
         product_code:      r.product_code,
         container_size:    r.container_size,
@@ -230,12 +313,53 @@ const getVarianceReport = async (req, res) => {
       };
     });
 
-    data.sort((a, b) => (a.product_name || '').localeCompare(b.product_name || ''));
+    // ── Filas de PRE-BATCH (misma forma de fila que los productos) ────────────
+    //    Los preps se producen internamente, no entran por factura: Purchase = 0.
+    //    id_product va como "prep-<id>" para que cada fila siga teniendo una clave
+    //    única (no choca con los ids numéricos de productos); el id real va en id_prep.
+    const prepData = prepRows.map(r => {
+      const key       = String(r.id_prep);
+      const yieldUnit = r.yield_unit || '';
+
+      const stock    = sumPrepQty(currentPrepByPrep[key] || [], yieldUnit);
+      const opening  = sumPrepQty(prevPrepByPrep[key]    || [], yieldUnit);
+      const purchase = 0;
+      const sold     = 0;
+      const variance = stock - (opening + purchase) + sold;
+
+      const unitPrice = parseFloat(r.yield_unit_cost) || 0;   // costo por unidad de rendimiento
+      const total     = parseFloat(r.total_ws) || 0;          // valor GUARDADO, igual que productos
+      wsTotal += total;
+
+      return {
+        id_product:        `prep-${r.id_prep}`,
+        id_prep:           r.id_prep,
+        item_type:         'prep',
+        product_name:      r.prep_name,
+        product_code:      '',
+        container_size:    r.yield_quantity,
+        container_unit:    r.yield_unit,
+        category_name:     'Pre-Batch',
+        product_type_name: 'Pre-Batch',
+        opening_last_inv:  parseFloat(opening.toFixed(4)),
+        purchase:          parseFloat(purchase.toFixed(4)),
+        sold,
+        variance:          parseFloat(variance.toFixed(4)),
+        stock_on_hand:     parseFloat(stock.toFixed(4)),
+        unit_price:        parseFloat(unitPrice.toFixed(4)),
+        total:             parseFloat(total.toFixed(4)),
+        order_by:          r.yield_unit || null,
+        case_size:         1
+      };
+    });
+
+    const allRows = [...data, ...prepData];
+    allRows.sort((a, b) => (a.product_name || '').localeCompare(b.product_name || ''));
 
     res.json({
       success: true,
       data: {
-        rows:         data,
+        rows:         allRows,
         ws_total:     parseFloat(wsTotal.toFixed(2)),
         prev_date:    prevDate,
         current_date: currentDate

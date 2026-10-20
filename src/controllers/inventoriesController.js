@@ -330,7 +330,7 @@ const getAvailableProducts = async (req, res) => {
     );
 
     const [preps] = await pool.execute(
-      `SELECT 
+      `SELECT
         id_preps as id,
         prep_name as name,
         total_cost,
@@ -344,7 +344,55 @@ const getAvailableProducts = async (req, res) => {
       [storeId]
     );
 
-    res.json({ success: true, data: products, preps });
+    // Last Inv por producto = SUMA del día Locked más reciente de TODA la tienda
+    // (misma definición que usa Physical Inventory). Las cantidades por peso/volumen
+    // se convierten a "contenedores" igual que en getProductsForPrintInventory.
+    const [lastInvRows] = await pool.execute(
+      `SELECT
+         ii.id_product,
+         ROUND(SUM(
+           CASE
+             WHEN ii.quantity_type IN ('Bottle', 'Can', 'Keg', 'Each', 'Box', 'Bag', 'Carton') THEN ii.quantity
+             WHEN ii.quantity_type IN ('g', 'kg', 'oz', 'lb', 'ml', 'L', 'Liter', 'Gallon', 'fl oz') THEN
+               CASE
+                 WHEN ii.net_weight > 0 AND ii.full_weight > 0 AND ii.empty_weight IS NOT NULL AND ii.empty_weight > 0 THEN
+                   (CASE ii.quantity_type
+                     WHEN 'kg' THEN ii.quantity * 1000 WHEN 'oz' THEN ii.quantity * 28.3495
+                     WHEN 'lb' THEN ii.quantity * 453.592 WHEN 'L' THEN ii.quantity * 1000
+                     WHEN 'Liter' THEN ii.quantity * 1000 WHEN 'Gallon' THEN ii.quantity * 3785.41
+                     WHEN 'fl oz' THEN ii.quantity * 29.5735 ELSE ii.quantity END
+                     - ii.empty_weight) / ii.net_weight
+                 ELSE ii.product_weight_grams / NULLIF(p.container_size_base_unit, 0)
+               END
+             ELSE ii.quantity
+           END
+         ), 2) AS last_quantity
+       FROM inventory_items ii
+       INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+       INNER JOIN products p    ON ii.id_product   = p.id_products
+       WHERE i.id_store = ?
+         AND i.status = 'Locked'
+         AND ii.item_type = 'product'
+         AND DATE(i.inventory_date) = (
+           SELECT DATE(i2.inventory_date)
+           FROM inventories i2
+           WHERE i2.id_store = ?
+             AND i2.status = 'Locked'
+           ORDER BY i2.inventory_date DESC
+           LIMIT 1
+         )
+       GROUP BY ii.id_product`,
+      [storeId, storeId]
+    );
+    const lastInvMap = {};
+    lastInvRows.forEach(r => { lastInvMap[r.id_product] = parseFloat(r.last_quantity) || 0; });
+
+    const productsWithLastInv = products.map(p => ({
+      ...p,
+      last_inv_quantity: lastInvMap[p.id] ?? 0
+    }));
+
+    res.json({ success: true, data: productsWithLastInv, preps });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error fetching available products', error: error.message });
   }
