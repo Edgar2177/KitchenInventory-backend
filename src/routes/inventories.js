@@ -16,6 +16,7 @@ const {
   getProductsForPrintInventory,
   getInventoriesByLocation,
   getInventoryProducts,
+  searchProductInInventories,
   getUncountedByDate,
 } = require('../controllers/inventoriesController');
 
@@ -26,6 +27,8 @@ router.get('/last-products/:locationId', getLastInventoryProducts);
 router.get('/print-format', getProductsForPrintInventory);
 router.get('/by-location/:locationId', getInventoriesByLocation);
 router.get('/uncounted-by-date', getUncountedByDate);
+router.get('/search-product', searchProductInInventories);
+
 
 // Rutas CRUD básicas
 router.get('/', getAllInventories);

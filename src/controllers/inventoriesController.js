@@ -1468,7 +1468,157 @@ const getProductsForPrintInventory = async (req, res) => {
   }
 };
 
+// ========================================
+// BUSCAR PRODUCTO EN INVENTARIOS DE UNA FECHA
+// GET /inventories/search-product?storeId=&date=YYYY-MM-DD&q=texto
+// Por cada producto que coincida (nombre o código) devuelve, por location:
+//   - weight_type / quantity : lo contado en los inventarios de esa fecha
+//   - last_quantity / last_weight_type : lo contado en el último inventario
+//     Locked anterior a esa fecha (misma definición de "Last Inv" del resto del módulo:
+//     el día Locked más reciente de la tienda, filtrado por location)
+// Las cantidades van tal cual se capturaron (g, Bottle, Each...), sin convertir.
+// ========================================
+const searchProductInInventories = async (req, res) => {
+  try {
+    const { storeId, date, q } = req.query;
+    const term = (q || '').trim();
+    if (!storeId || !date) {
+      return res.status(400).json({ success: false, message: 'storeId and date are required' });
+    }
+    if (term.length < 2) {
+      return res.json({ success: true, data: [], prev_date: null });
+    }
+
+    // Escapa comodines de LIKE para que "50%" o "a_b" se busquen literal
+    const like = `%${term.replace(/[\\%_]/g, '\\$&')}%`;
+
+    const [products] = await pool.execute(
+      `SELECT p.id_products AS id_product, p.product_name, p.product_code, p.container_type
+       FROM products p
+       INNER JOIN products_by_store pbs ON p.id_products = pbs.id_product
+       WHERE pbs.id_store = ?
+         AND (p.product_name LIKE ? OR p.product_code LIKE ?)
+       ORDER BY p.product_name ASC
+       LIMIT 25`,
+      [storeId, like, like]
+    );
+    if (products.length === 0) {
+      return res.json({ success: true, data: [], prev_date: null });
+    }
+    const ids = products.map(p => p.id_product);
+    const idPlaceholders = ids.map(() => '?').join(',');
+
+    // Inventario Locked inmediatamente anterior a la fecha elegida (toda la tienda)
+    const [prevRows] = await pool.execute(
+      `SELECT DATE_FORMAT(MAX(DATE(i.inventory_date)), '%Y-%m-%d') AS prev_date
+       FROM inventories i
+       WHERE i.id_store = ?
+         AND i.status = 'Locked'
+         AND DATE(i.inventory_date) < ?`,
+      [storeId, date]
+    );
+    const prevDate = prevRows[0]?.prev_date || null;
+
+    // Cantidades por producto / location / tipo de peso en un día dado
+    const loadDay = async (day, onlyLocked) => {
+      const [rows] = await pool.execute(
+        `SELECT
+           ii.id_product,
+           COALESCE(ii.id_location, i.id_location)  AS id_location,
+           COALESCE(l.location_name, 'No location') AS location_name,
+           ii.quantity_type,
+           SUM(ii.quantity)                          AS quantity
+         FROM inventory_items ii
+         INNER JOIN inventories i ON ii.id_inventory = i.id_inventories
+         LEFT  JOIN locations   l ON l.id_locations = COALESCE(ii.id_location, i.id_location)
+         WHERE i.id_store = ?
+           AND DATE(i.inventory_date) = ?
+           ${onlyLocked ? "AND i.status = 'Locked'" : ''}
+           AND ii.item_type = 'product'
+           AND ii.quantity IS NOT NULL
+           AND ii.id_product IN (${idPlaceholders})
+         GROUP BY ii.id_product, COALESCE(ii.id_location, i.id_location), l.location_name, ii.quantity_type
+         ORDER BY location_name ASC`,
+        [storeId, day, ...ids]
+      );
+      return rows;
+    };
+
+    const currentRows = await loadDay(date, false);
+    const lastRows    = prevDate ? await loadDay(prevDate, true) : [];
+
+    const round = (n) => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+    // Physical Inventory guarda TODO con quantity_type 'Each' (cuenta contenedores).
+    // Para que no salga como un tipo aparte, 'Each' se muestra como el contenedor
+    // del producto (Bottle, Can, Bag...). Después se suman las filas que quedaron
+    // iguales (mismo producto, location y tipo).
+    const containerOf = {};
+    products.forEach(p => { containerOf[p.id_product] = p.container_type; });
+    const normalizeRows = (rows) => {
+      const merged = {};
+      rows.forEach(r => {
+        const ct = containerOf[r.id_product];
+        const type = (r.quantity_type === 'Each' && ct && ct !== 'Each') ? ct : r.quantity_type;
+        const key = `${r.id_product}|${r.id_location ?? 'none'}|${type}`;
+        if (!merged[key]) merged[key] = { ...r, quantity_type: type, quantity: 0 };
+        merged[key].quantity += parseFloat(r.quantity) || 0;
+      });
+      return Object.values(merged);
+    };
+
+    // product -> location -> fila combinada (actual + último)
+    const byProduct = {};
+    const rowFor = (idProduct, idLocation, locationName) => {
+      const pk = String(idProduct);
+      const lk = String(idLocation ?? 'none');
+      byProduct[pk] = byProduct[pk] || {};
+      byProduct[pk][lk] = byProduct[pk][lk] || {
+        id_location: idLocation,
+        location_name: locationName,
+        weight_type: null,
+        quantity: null,
+        last_weight_type: null,
+        last_quantity: null,
+      };
+      return byProduct[pk][lk];
+    };
+
+    normalizeRows(currentRows).forEach(r => {
+      const row = rowFor(r.id_product, r.id_location, r.location_name);
+      // Si en una misma location hubo dos tipos de peso, se queda el de mayor cantidad
+      if (row.quantity === null || round(r.quantity) > row.quantity) {
+        row.weight_type = r.quantity_type;
+        row.quantity    = round(r.quantity);
+      }
+    });
+    normalizeRows(lastRows).forEach(r => {
+      const row = rowFor(r.id_product, r.id_location, r.location_name);
+      if (row.last_quantity === null || round(r.quantity) > row.last_quantity) {
+        row.last_weight_type = r.quantity_type;
+        row.last_quantity    = round(r.quantity);
+      }
+    });
+
+    // Solo productos que aparecen en alguno de los dos días
+    const data = products
+      .filter(p => byProduct[String(p.id_product)])
+      .map(p => ({
+        id_product:   p.id_product,
+        product_name: p.product_name,
+        product_code: p.product_code,
+        locations: Object.values(byProduct[String(p.id_product)])
+          .sort((a, b) => String(a.location_name).localeCompare(String(b.location_name))),
+      }));
+
+    res.json({ success: true, data, prev_date: prevDate, date });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Error searching product', error: error.message });
+  }
+};
+
 module.exports = {
+  searchProductInInventories,
   getAllInventories,
   getInventoryById,
   createInventory,
