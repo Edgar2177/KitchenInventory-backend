@@ -1600,16 +1600,59 @@ const searchProductInInventories = async (req, res) => {
       }
     });
 
+    // Unifica la unidad de medida de un producto: si TODAS sus filas (actual y último)
+    // son de peso (g, kg, oz, lb) o TODAS de volumen (ml, L, Liter, Gallon, fl oz),
+    // se convierten a una sola unidad: la que más se usó en sus locations
+    // (si empatan, la más pequeña, p. ej. g antes que kg).
+    // Si se mezclan familias (peso + contenedores, etc.) no se puede convertir
+    // sin inventar equivalencias, así que se dejan como se capturaron.
+    const round3 = (n) => Math.round(n * 1000) / 1000;
+    const unifyUnits = (locations) => {
+      const used = [];
+      locations.forEach(l => {
+        if (l.quantity !== null && l.weight_type) used.push(l.weight_type);
+        if (l.last_quantity !== null && l.last_weight_type) used.push(l.last_weight_type);
+      });
+      if (used.length === 0) return null;
+      const family = (u) => WEIGHT_UNITS.includes(u) ? 'weight' : (VOLUME_UNITS.includes(u) ? 'volume' : null);
+      const fam = family(used[0]);
+      if (!fam || !used.every(u => family(u) === fam)) return null;
+
+      const counts = {};
+      used.forEach(u => { counts[u] = (counts[u] || 0) + 1; });
+      const target = Object.keys(counts).sort((a, b) =>
+        (counts[b] - counts[a]) || (GRAMS[a] - GRAMS[b]) || a.localeCompare(b)
+      )[0];
+
+      const conv = (qty, from) => from === target ? qty : round3(qty * GRAMS[from] / GRAMS[target]);
+      locations.forEach(l => {
+        if (l.quantity !== null && l.weight_type) {
+          l.quantity = conv(l.quantity, l.weight_type);
+          l.weight_type = target;
+        }
+        if (l.last_quantity !== null && l.last_weight_type) {
+          l.last_quantity = conv(l.last_quantity, l.last_weight_type);
+          l.last_weight_type = target;
+        }
+      });
+      return target;
+    };
+
     // Solo productos que aparecen en alguno de los dos días
     const data = products
       .filter(p => byProduct[String(p.id_product)])
-      .map(p => ({
-        id_product:   p.id_product,
-        product_name: p.product_name,
-        product_code: p.product_code,
-        locations: Object.values(byProduct[String(p.id_product)])
-          .sort((a, b) => String(a.location_name).localeCompare(String(b.location_name))),
-      }));
+      .map(p => {
+        const locations = Object.values(byProduct[String(p.id_product)])
+          .sort((a, b) => String(a.location_name).localeCompare(String(b.location_name)));
+        const unit = unifyUnits(locations);
+        return {
+          id_product:   p.id_product,
+          product_name: p.product_name,
+          product_code: p.product_code,
+          unit,                       // unidad única del producto, o null si no se pudo unificar
+          locations,
+        };
+      });
 
     res.json({ success: true, data, prev_date: prevDate, date });
   } catch (error) {
